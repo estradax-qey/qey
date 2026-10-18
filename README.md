@@ -19,6 +19,17 @@ if (!db.ok()) { /* db.status().message() */ }
 (*db)->Set("greeting", "hello", std::chrono::seconds(60));  // optional TTL
 std::optional<std::string> v = (*db)->Get("greeting");
 (*db)->Incr("visits");
+(*db)->Append("log", "more text");
+(*db)->Rename("old-name", "new-name");
+
+// Keys are ordered, so prefix queries are cheap. Page through them with Scan.
+std::vector<std::string> all = (*db)->Keys("user:");
+std::optional<std::string> cursor;
+do {
+  qey::ScanPage page = (*db)->Scan("user:", 100, cursor);
+  // ... use page.keys ...
+  cursor = page.next;
+} while (cursor.has_value());
 ```
 
 The log compacts itself as it grows, and the file is locked while open, so a

@@ -50,9 +50,17 @@ record := length:u32  crc32:u32  type:u8  payload[length - 1]
 | 2    | DEL     | key                              |
 | 3    | EXPIRE  | key, expires_at_ms:i64           |
 | 4    | PERSIST | key                              |
+| 5    | APPEND  | key, suffix                      |
+| 6    | RENAME  | key (source), new key            |
 
 Other operations log as these. `Incr`/`Decr` log a `SET` with the resulting
 value and the key's current expiry, so replay never re-does arithmetic.
+`Append` logs only the suffix as an `APPEND`, so appending to a large value
+does not rewrite it; but appending to a missing or expired key logs a `SET`,
+so replay never depends on a stale earlier value. `Rename` is a single record,
+so a crash leaves either the old name or the new one, never both or neither.
+`Clear` has no record: it replaces the log with an empty one through the same
+atomic mechanism as compaction, so the file shrinks immediately.
 Lazy expiry and `Sweep()` are **not** logged: expiry is derived from the
 stored absolute times, and keys already expired at replay are skipped.
 
