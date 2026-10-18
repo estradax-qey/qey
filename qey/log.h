@@ -56,6 +56,9 @@ struct Record {
     // key, n1 and n2: keep elements n1 through n2, both from 0. An n2 below
     // n1 keeps nothing, which removes the key.
     kLTrim = 16,
+    // Sets.
+    kSAdd = 17,  // key, n1 (fresh), items (members that were not there)
+    kSRem = 18,  // key, items (members that were there)
   };
 
   Record() = default;

@@ -134,9 +134,11 @@ const Shape* ShapeOf(Record::Type type) {
     case T::kHSet:
       return &kPairs;
     case T::kHDel:
+    case T::kSRem:
       return &kStrings;
     case T::kLPush:
     case T::kRPush:
+    case T::kSAdd:
       return &kFreshStrings;
     case T::kLPop:
     case T::kRPop:
@@ -162,6 +164,9 @@ bool FitsShape(const Shape& shape, const Record& record) {
   }
   if (shape.ints >= 1 && record.n1 < shape.n1_min) return false;
   if (shape.ints >= 2 && record.n2 < shape.n2_min) return false;
+  // Fields the layout does not use must be left alone.
+  if (!shape.fresh && shape.ints == 0 && record.n1 != 0) return false;
+  if (shape.ints < 2 && record.n2 != 0) return false;
   return true;
 }
 
@@ -179,7 +184,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 16) return false;
+  if (type < 1 || type > 18) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -266,7 +271,7 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kLTrim) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kSRem) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&

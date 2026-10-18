@@ -94,6 +94,9 @@ std::vector<Record> SampleRecords() {
       Coll(Type::kLSet, "l", {"new"}, 0),
       Coll(Type::kLTrim, "l", {}, 1, 3),
       Coll(Type::kLTrim, "l", {}, 0, -1),
+      Coll(Type::kSAdd, "s", {"m1", "m2", ""}, 1),
+      Coll(Type::kSAdd, "s", {"m3"}),
+      Coll(Type::kSRem, "s", {"m1", "m3"}),
       Replace("a", "42"),
       Replace("", ""),
       Batch({Replace("k", "1"), Set("j", "2")}),
@@ -426,6 +429,10 @@ TEST(AppendRecordTest, RejectsInvalidListRecords) {
            Coll(Type::kLTrim, "l", {}, -1, 5),     // negative start
            Coll(Type::kLTrim, "l", {}, 0, -2),     // stop below -1
            Coll(Type::kLTrim, "l", {"x"}, 0, 1),   // takes no strings
+           Coll(Type::kSAdd, "s", {}),             // nothing to add
+           Coll(Type::kSAdd, "s", {"a"}, 2),       // bad fresh flag
+           Coll(Type::kSRem, "s", {}),             // nothing to remove
+           Coll(Type::kSRem, "s", {"a"}, 1),       // no flag in this one
        }) {
     EXPECT_EQ(AppendRecord(f, bad).code(), StatusCode::kInvalidArgument);
   }
