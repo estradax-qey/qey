@@ -201,6 +201,57 @@ TEST_F(DbTest, DecrDetectsUnderflowAndHandlesInt64Min) {
   EXPECT_EQ(*r, std::numeric_limits<int64_t>::max());
 }
 
+TEST_F(DbTest, SweepRemovesOnlyExpiredKeys) {
+  db_.Set("a", "1", milliseconds(10));
+  db_.Set("b", "2", milliseconds(20));
+  db_.Set("c", "3");
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Size(), 2);
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Size(), 1);
+  EXPECT_EQ(db_.Get("c"), "3");
+}
+
+TEST_F(DbTest, SizeCountsUnsweptExpiredKeys) {
+  db_.Set("a", "1", milliseconds(10));
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Size(), 1);
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Size(), 0);
+}
+
+TEST_F(DbTest, SweepHonorsLimit) {
+  for (const char* k : {"a", "b", "c"}) db_.Set(k, "v", milliseconds(10));
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(2), 2);
+  EXPECT_EQ(db_.Size(), 1);
+  EXPECT_EQ(db_.Sweep(2), 1);
+  EXPECT_EQ(db_.Size(), 0);
+}
+
+TEST_F(DbTest, SweepIgnoresKeysWhoseExpiryChanged) {
+  db_.Set("a", "1", milliseconds(10));
+  db_.Set("b", "2", milliseconds(10));
+  db_.Set("c", "3", milliseconds(10));
+  db_.Expire("a", milliseconds(1000));
+  db_.Persist("b");
+  db_.Set("c", "3");
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 0);
+  EXPECT_EQ(db_.Size(), 3);
+}
+
+TEST_F(DbTest, SweepAfterDelDoesNotTouchOtherKeys) {
+  db_.Set("a", "1", milliseconds(10));
+  db_.Set("b", "2", milliseconds(10));
+  db_.Del("a");
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Size(), 0);
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   db.Set("k", "v", milliseconds(60000));

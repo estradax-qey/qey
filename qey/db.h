@@ -2,13 +2,17 @@
 #define QEY_DB_H_
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 #include "qey/status.h"
 
@@ -16,7 +20,9 @@ namespace qey {
 
 // An in-memory key-value store. All methods are thread-safe.
 //
-// Expiry is lazy: an expired key is removed the next time it is accessed.
+// Expired keys are removed lazily the next time they are accessed. Keys that
+// are never accessed again are reclaimed by calling Sweep(), which the owner
+// should do periodically.
 class Db {
  public:
   // The expiry state of a key, as reported by GetTtl().
@@ -65,6 +71,15 @@ class Db {
   // Like Incr(), but subtracts `delta`.
   StatusOr<int64_t> Decr(std::string_view key, int64_t delta = 1);
 
+  // Removes expired keys, at most `limit` of them, and returns how many were
+  // removed. The limit bounds how long the store is locked; call again if the
+  // result equals `limit`.
+  size_t Sweep(size_t limit = std::numeric_limits<size_t>::max());
+
+  // Returns the number of stored keys, including expired keys that have not
+  // been removed yet.
+  size_t Size();
+
   // Returns true if `key` exists and has not expired.
   bool Exists(std::string_view key);
 
@@ -90,6 +105,14 @@ class Db {
   // has expired. Returns map_.end() if there is none. Requires `mu_` held.
   Map::iterator FindLive(std::string_view key);
 
+  // Sets or clears the expiry of the entry at `it`, keeping `expiry_` in sync.
+  // Requires `mu_` held.
+  void SetExpiryLocked(Map::iterator it, Clock::time_point at);
+  void ClearExpiryLocked(Map::iterator it);
+
+  // Removes the entry at `it` and its expiry. Requires `mu_` held.
+  void EraseLocked(Map::iterator it);
+
   // Implements Incr() and Decr(). Requires `mu_` held.
   StatusOr<int64_t> AddLocked(std::string_view key, int64_t delta,
                               bool subtract);
@@ -97,6 +120,9 @@ class Db {
   NowFn now_;
   std::mutex mu_;
   Map map_;
+  // Mirrors the expiry of every entry in `map_` that has one, ordered by
+  // expiry time, so Sweep() only visits keys that are due.
+  std::set<std::pair<Clock::time_point, std::string>> expiry_;
 };
 
 }  // namespace qey
