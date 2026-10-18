@@ -52,6 +52,11 @@ record := length:u32  crc32:u32  type:u8  payload[length - 1]
 | 4    | PERSIST | key                              |
 | 5    | APPEND  | key, suffix                      |
 | 6    | RENAME  | key (source), new key            |
+| 7    | BATCH   | count:u32, then count x (length:u32, body) |
+
+A BATCH holds other records (any type except BATCH) as members. The members
+share the BATCH's checksum, so the log has all of them or none: a crash that
+tears the record drops it whole, and a bad checksum is never half-applied.
 
 Other operations log as these. `Incr`/`Decr` log a `SET` with the resulting
 value and the key's current expiry, so replay never re-does arithmetic.
@@ -59,6 +64,14 @@ value and the key's current expiry, so replay never re-does arithmetic.
 does not rewrite it; but appending to a missing or expired key logs a `SET`,
 so replay never depends on a stale earlier value. `Rename` is a single record,
 so a crash leaves either the old name or the new one, never both or neither.
+`Db::Write(WriteBatch)` logs the batch's *effective* changes, those that did
+something when applied in order, as one BATCH, or as a plain record if there is
+only one. Changes that name a missing key are left out, and an `Append` to a
+missing or expired key becomes a `SET`, so replaying never depends on state the
+log does not hold. A batch is applied to memory first, through the same function
+replay uses, keeping what it overwrote; if logging then fails it is rolled
+back, so memory never gets ahead of the log. Other threads cannot see the
+intermediate states because the whole thing runs under the store's lock.
 `Clear` has no record: it replaces the log with an empty one through the same
 atomic mechanism as compaction, so the file shrinks immediately.
 Lazy expiry and `Sweep()` are **not** logged: expiry is derived from the

@@ -22,6 +22,12 @@ std::optional<std::string> v = (*db)->Get("greeting");
 (*db)->Append("log", "more text");
 (*db)->Rename("old-name", "new-name");
 
+// Several changes as one unit: all of them or none, even across a crash.
+qey::WriteBatch batch;
+batch.Decr("stock:widget", 2).Incr("sold:widget", 2).Set("order:42", "paid");
+(*db)->Write(batch);  // fails whole if, say, "stock:widget" is not a number
+auto values = (*db)->MGet({"stock:widget", "sold:widget"});  // read together
+
 // Keys are ordered, so prefix queries are cheap. Page through them with Scan.
 std::vector<std::string> all = (*db)->Keys("user:");
 std::optional<std::string> cursor;
