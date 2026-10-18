@@ -57,6 +57,7 @@ class [[nodiscard]] StatusOr {
     return *value_;
   }
   const T& operator*() const { return value(); }
+  const T* operator->() const { return &value(); }
 
  private:
   Status status_;

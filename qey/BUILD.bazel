@@ -29,3 +29,59 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_library(
+    name = "crc32",
+    srcs = ["crc32.cc"],
+    hdrs = ["crc32.h"],
+)
+
+cc_test(
+    name = "crc32_test",
+    srcs = ["crc32_test.cc"],
+    deps = [
+        ":crc32",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "file",
+    hdrs = ["file.h"],
+    visibility = ["//visibility:public"],
+    deps = [":status"],
+)
+
+cc_library(
+    name = "memory_file",
+    testonly = True,
+    srcs = ["memory_file.cc"],
+    hdrs = ["memory_file.h"],
+    deps = [
+        ":file",
+        ":status",
+    ],
+)
+
+cc_library(
+    name = "log",
+    srcs = ["log.cc"],
+    hdrs = ["log.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":crc32",
+        ":file",
+        ":status",
+    ],
+)
+
+cc_test(
+    name = "log_test",
+    srcs = ["log_test.cc"],
+    deps = [
+        ":crc32",
+        ":log",
+        ":memory_file",
+        "@googletest//:gtest_main",
+    ],
+)
