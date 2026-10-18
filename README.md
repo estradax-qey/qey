@@ -24,7 +24,10 @@ std::optional<std::string> v = (*db)->Get("greeting");
 The log compacts itself as it grows, and the file is locked while open, so a
 second `Open` of the same path fails with `kUnavailable`.
 
-By default every write is synced to disk before it returns. See
+By default every write is synced to disk before it returns. For higher write
+throughput, `SyncPolicy::kInterval` syncs once per second instead, trading up
+to about a second of recent writes on a crash. Time-to-live values longer than
+`Db::kMaxTtl` (100 years) are rejected. See
 [docs/design/persistence.md](docs/design/persistence.md) for the file format
 and crash behavior.
 

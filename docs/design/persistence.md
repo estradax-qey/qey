@@ -63,14 +63,30 @@ skipped, so a newer file is never silently misread by an older reader.
 
 `OpenOptions::sync`:
 
-| policy    | behavior                                  | use                   |
-|-----------|-------------------------------------------|-----------------------|
-| `kAlways` | sync after every write (default)          | no acknowledged loss  |
-| `kManual` | never sync; owner calls `Db::Sync()`      | caches, bulk loads    |
+| policy      | behavior                                          | use                  |
+|-------------|---------------------------------------------------|----------------------|
+| `kAlways`   | sync after every write (default)                  | no acknowledged loss |
+| `kInterval` | sync at most every `sync_interval` (default 1 s)  | most applications    |
+| `kManual`   | never sync; owner calls `Db::Sync()`              | caches, bulk loads   |
 
 `kAlways` is the default because a durable store that quietly loses data is
-the worse surprise. A timer-based policy is left to the owner (call `Sync()`
-periodically, as with `Sweep()`), since the library starts no threads.
+the worse surprise.
+
+`kInterval` bounds the loss window instead of paying an fsync per write. Dirty
+data is synced by whichever comes first: a write that arrives after the
+interval has passed, a background thread that wakes every interval
+(`sync_thread`, on by default), or the owner calling `Db::SyncIfDue()`. The
+thread is what covers the idle case, where the last writes would otherwise sit
+unsynced until the next write. Owners who want no threads can set
+`sync_thread = false` and drive `SyncIfDue()` from their own timer. A crash can
+lose writes from up to about one interval before it, but never corrupts the
+log, because records are appended in order and recovery drops only a torn tail.
+
+Every policy syncs unsynced writes when the `Db` is destroyed.
+
+A failed sync, whether inline or in the background thread, puts the `Db` in the
+failed state: writes and `Sync()` return `kIoError` naming the first cause,
+until the store is reopened.
 
 "Sync" means `fsync`, and `fcntl(F_FULLFSYNC)` on macOS, where plain `fsync`
 does not flush the drive's cache.
@@ -160,6 +176,8 @@ the in-memory API (`feat!`):
 ```cpp
 struct OpenOptions {
   SyncPolicy sync = SyncPolicy::kAlways;
+  std::chrono::milliseconds sync_interval{1000};  // kInterval
+  bool sync_thread = true;                        // kInterval
   Recovery recovery = Recovery::kTruncate;
   bool auto_compact = true;
   uint64_t compact_min_bytes = 4 << 20;
@@ -205,5 +223,4 @@ signatures. New status codes: `kIoError`, `kCorruption`, `kUnavailable`,
 ## Possible later work
 
 - Background compaction, so writers are not blocked.
-- A periodic-sync policy (`kEverySecond`) with an optional sync thread.
 - Windows support (a `Storage` implementation).
