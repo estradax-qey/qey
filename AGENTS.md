@@ -11,9 +11,13 @@ It is inspired by Redis/Valkey. Licensed under MIT.
 - Build system: Bazel (via Bazelisk). Modules are managed with `MODULE.bazel`.
 - Build everything: `bazel build //...`
 - Run all tests: `bazel test //...`
+- Run under sanitizers: `bazel test --config=asan //...` (AddressSanitizer and
+  UBSan) and `bazel test --config=tsan //...` (ThreadSanitizer). Run `tsan`
+  after changing anything that involves threads or locking.
 - Language standard: C++20 (set in `.bazelrc`).
-- CI (`.github/workflows/ci.yml`) checks formatting and runs `bazel test //...`
-  on Linux and macOS for every push to `main` and every pull request.
+- CI (`.github/workflows/ci.yml`) checks formatting, runs `bazel test //...`
+  on Linux and macOS, and runs the `asan` and `tsan` configs on Linux, for
+  every push to `main` and every pull request.
 
 ## Code style
 

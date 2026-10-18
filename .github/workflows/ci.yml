@@ -41,3 +41,26 @@ jobs:
           repository-cache: true
       - name: Build and test
         run: bazel test //... --test_output=errors
+
+  # Sanitizers run on Linux only. ASan and UBSan are combined; TSan needs its
+  # own build. See the sanitizer configs in .bazelrc.
+  sanitize:
+    name: sanitize (${{ matrix.config }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [asan, tsan]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.config }}
+          repository-cache: true
+      # TSan fails to start on newer kernels with a high ASLR entropy.
+      - name: Lower ASLR entropy for TSan
+        if: matrix.config == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Build and test
+        run: bazel test --config=${{ matrix.config }} //... --test_output=errors
