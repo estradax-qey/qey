@@ -276,6 +276,13 @@ class Db {
 
   Db(NowFn now, WallNowFn wall_now);
 
+  // A reading of both clocks taken together.
+  struct ClockPoint {
+    Clock::time_point steady;
+    int64_t wall_ms;  // Unix time, in milliseconds.
+  };
+  ClockPoint ReadClocks();
+
   // Replays the log into memory and repairs its tail. Used by Open().
   Status Recover(Recovery recovery);
 
@@ -312,12 +319,15 @@ class Db {
 
   // Applies a record read from the log, without logging it. Requires `mu_`
   // held (or exclusive access during Open()).
-  void ApplyRecordLocked(Record&& record);
+  void ApplyRecordLocked(Record&& record, const ClockPoint& ref);
 
   // Converts between the monotonic clock used in memory and the Unix time
   // stored in the log.
-  int64_t ToWallMs(Clock::time_point at);
-  Clock::time_point FromWallMs(int64_t unix_ms);
+  // Both go through one ClockPoint, so that a deadline that is converted to
+  // Unix time and back comes out exactly as it went in, however long the
+  // conversions take and whatever the wall clock does in between.
+  int64_t ToWallMs(Clock::time_point at, const ClockPoint& ref);
+  Clock::time_point FromWallMs(int64_t unix_ms, const ClockPoint& ref);
 
   // Returns an iterator to the live entry for `key`, erasing it first if it
   // has expired. Returns map_.end() if there is none. Requires `mu_` held.
@@ -346,7 +356,7 @@ class Db {
   // overwrote in `undo`. Fails without side effects beyond `undo`. Requires
   // `mu_` held.
   Status StageLocked(const WriteBatch::Op& op, Undo* undo,
-                     std::vector<Record>* effective);
+                     std::vector<Record>* effective, const ClockPoint& ref);
 
   // Puts back everything recorded in `undo`. Requires `mu_` held.
   void RollbackLocked(const Undo& undo);

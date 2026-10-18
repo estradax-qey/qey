@@ -135,9 +135,11 @@ Db::~Db() {
 }
 
 Status Db::Recover(Recovery recovery) {
-  StatusOr<ReplayResult> replay =
-      Replay(storage_->log(), recovery,
-             [this](Record&& r) { ApplyRecordLocked(std::move(r)); });
+  // Every expiry in the log is placed relative to this one instant.
+  const ClockPoint ref = ReadClocks();
+  StatusOr<ReplayResult> replay = Replay(
+      storage_->log(), recovery,
+      [this, &ref](Record&& r) { ApplyRecordLocked(std::move(r), ref); });
   if (!replay.ok()) return replay.status();
 
   if (replay->valid_size == 0) {
@@ -186,12 +188,15 @@ Status Db::Set(std::string_view key, std::string_view value,
   }
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
+  const ClockPoint ref = ReadClocks();
   std::optional<Clock::time_point> expires_at;
-  if (ttl.has_value()) expires_at = now_() + ClampTtl(*ttl);
+  if (ttl.has_value()) expires_at = ref.steady + ClampTtl(*ttl);
 
   Record record{Record::Type::kSet, std::string(key), std::string(value),
                 std::nullopt};
-  if (expires_at.has_value()) record.expires_at_ms = ToWallMs(*expires_at);
+  if (expires_at.has_value()) {
+    record.expires_at_ms = ToWallMs(*expires_at, ref);
+  }
   Status s = LogLocked(record);
   if (!s.ok()) return s;
 
@@ -266,9 +271,10 @@ StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
   MaybeCompactLocked();
   auto it = FindLive(key);
   if (it == map_.end()) return false;
-  const Clock::time_point at = now_() + ClampTtl(ttl);
+  const ClockPoint ref = ReadClocks();
+  const Clock::time_point at = ref.steady + ClampTtl(ttl);
   Status s = LogLocked(
-      Record{Record::Type::kExpire, std::string(key), "", ToWallMs(at)});
+      Record{Record::Type::kExpire, std::string(key), "", ToWallMs(at, ref)});
   if (!s.ok()) return s;
   SetExpiryLocked(it, at);
   return true;
@@ -361,8 +367,9 @@ Status Db::Write(const WriteBatch& batch) {
   // lock is released.
   Undo undo;
   std::vector<Record> effective;
+  const ClockPoint ref = ReadClocks();  // one instant for the whole batch
   for (const WriteBatch::Op& op : batch.ops_) {
-    Status s = StageLocked(op, &undo, &effective);
+    Status s = StageLocked(op, &undo, &effective, ref);
     if (!s.ok()) {
       RollbackLocked(undo);
       return s;
@@ -386,7 +393,7 @@ Status Db::Write(const WriteBatch& batch) {
 }
 
 Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
-                       std::vector<Record>* effective) {
+                       std::vector<Record>* effective, const ClockPoint& ref) {
   using Type = WriteBatch::Op::Type;
 
   auto remember = [&](std::string_view key) {
@@ -400,7 +407,7 @@ Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
   // one cannot differ.
   auto apply = [&](Record record) {
     Record copy = record;
-    ApplyRecordLocked(std::move(copy));
+    ApplyRecordLocked(std::move(copy), ref);
     effective->push_back(std::move(record));
   };
 
@@ -409,7 +416,7 @@ Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
       remember(op.key);
       Record record{Record::Type::kSet, op.key, op.arg, std::nullopt};
       if (op.ttl.has_value()) {
-        record.expires_at_ms = ToWallMs(now_() + ClampTtl(*op.ttl));
+        record.expires_at_ms = ToWallMs(ref.steady + ClampTtl(*op.ttl), ref);
       }
       apply(std::move(record));
       break;
@@ -424,7 +431,7 @@ Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
       if (FindLive(op.key) == map_.end()) break;
       remember(op.key);
       apply(Record{Record::Type::kExpire, op.key, "",
-                   ToWallMs(now_() + ClampTtl(*op.ttl))});
+                   ToWallMs(ref.steady + ClampTtl(*op.ttl), ref)});
       break;
     }
     case Type::kPersist: {
@@ -466,7 +473,7 @@ Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
       Record record{Record::Type::kSet, op.key, std::to_string(*added),
                     std::nullopt};
       if (it != map_.end() && it->second.expires_at.has_value()) {
-        record.expires_at_ms = ToWallMs(*it->second.expires_at);
+        record.expires_at_ms = ToWallMs(*it->second.expires_at, ref);
       }
       remember(op.key);
       apply(std::move(record));
@@ -627,7 +634,7 @@ StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
   // Log the resulting value, not the delta, so replay never redoes arithmetic.
   Record record{Record::Type::kSet, std::string(key), text, std::nullopt};
   if (it != map_.end() && it->second.expires_at.has_value()) {
-    record.expires_at_ms = ToWallMs(*it->second.expires_at);
+    record.expires_at_ms = ToWallMs(*it->second.expires_at, ReadClocks());
   }
   Status s = LogLocked(record);
   if (!s.ok()) return s;
@@ -694,7 +701,8 @@ void Db::MaybeCompactLocked() {
 }
 
 Status Db::CompactLocked(bool empty) {
-  const Clock::time_point now = now_();
+  const ClockPoint ref = ReadClocks();
+  const Clock::time_point now = ref.steady;
   Status s = storage_->Replace([&](File& out) -> Status {
     // Batch records so that a big database is not written one call per key.
     constexpr size_t kFlushBytes = 1 << 20;
@@ -704,7 +712,7 @@ Status Db::CompactLocked(bool empty) {
       if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
       Record record{Record::Type::kSet, key, entry.value, std::nullopt};
       if (entry.expires_at.has_value()) {
-        record.expires_at_ms = ToWallMs(*entry.expires_at);
+        record.expires_at_ms = ToWallMs(*entry.expires_at, ref);
       }
       Status encoded = EncodeRecord(record, &buf);
       if (!encoded.ok()) return encoded;
@@ -729,14 +737,14 @@ void Db::SetCompactThreshold(uint64_t base_size) {
                                           base_size * options_.compact_ratio);
 }
 
-void Db::ApplyRecordLocked(Record&& record) {
+void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
   switch (record.type) {
     case Record::Type::kSet: {
       auto it = InsertLocked(record.key);
       ClearExpiryLocked(it);
       it->second.value = std::move(record.value);
       if (record.expires_at_ms.has_value()) {
-        SetExpiryLocked(it, FromWallMs(*record.expires_at_ms));
+        SetExpiryLocked(it, FromWallMs(*record.expires_at_ms, ref));
       }
       break;
     }
@@ -748,7 +756,7 @@ void Db::ApplyRecordLocked(Record&& record) {
     case Record::Type::kExpire: {
       auto it = map_.find(record.key);
       if (it != map_.end()) {
-        SetExpiryLocked(it, FromWallMs(*record.expires_at_ms));
+        SetExpiryLocked(it, FromWallMs(*record.expires_at_ms, ref));
       }
       break;
     }
@@ -773,39 +781,37 @@ void Db::ApplyRecordLocked(Record&& record) {
     }
     case Record::Type::kBatch:
       for (Record& member : record.records) {
-        ApplyRecordLocked(std::move(member));
+        ApplyRecordLocked(std::move(member), ref);
       }
       break;
   }
 }
 
-int64_t Db::ToWallMs(Clock::time_point at) {
-  // Work in whole milliseconds. `at` is at most kMaxTtl from now, so none of
-  // this can overflow.
-  const int64_t wall_now_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          wall_now_().time_since_epoch())
-          .count();
-  const int64_t delta_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(at - now_())
-          .count();
-  return std::max<int64_t>(wall_now_ms + delta_ms, 0);
+Db::ClockPoint Db::ReadClocks() {
+  return {now_(), std::chrono::duration_cast<std::chrono::milliseconds>(
+                      wall_now_().time_since_epoch())
+                      .count()};
 }
 
-Db::Clock::time_point Db::FromWallMs(int64_t unix_ms) {
+int64_t Db::ToWallMs(Clock::time_point at, const ClockPoint& ref) {
+  // Work in whole milliseconds. `at` is at most kMaxTtl from `ref`, so none
+  // of this can overflow.
+  const int64_t delta_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(at - ref.steady)
+          .count();
+  return std::max<int64_t>(ref.wall_ms + delta_ms, 0);
+}
+
+Db::Clock::time_point Db::FromWallMs(int64_t unix_ms, const ClockPoint& ref) {
   // The log may hold any value, so saturate instead of overflowing: an expiry
   // further away than kMaxTtl is treated as kMaxTtl away.
-  const int64_t wall_now_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          wall_now_().time_since_epoch())
-          .count();
   const int64_t max_ms = kMaxTtl.count();
   int64_t delta_ms;
-  if (__builtin_sub_overflow(unix_ms, wall_now_ms, &delta_ms)) {
+  if (__builtin_sub_overflow(unix_ms, ref.wall_ms, &delta_ms)) {
     delta_ms = max_ms;
   }
   delta_ms = std::clamp<int64_t>(delta_ms, -max_ms, max_ms);
-  return now_() + std::chrono::milliseconds(delta_ms);
+  return ref.steady + std::chrono::milliseconds(delta_ms);
 }
 
 void Db::SetExpiryLocked(Map::iterator it, Clock::time_point at) {

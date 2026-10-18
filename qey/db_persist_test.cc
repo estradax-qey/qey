@@ -428,6 +428,31 @@ TEST_F(PersistTest, BatchAppendToAnExpiredKeyIsLoggedAsSet) {
   EXPECT_EQ(db->GetTtl("k").state, Db::TtlState::kNoExpiry);
 }
 
+TEST_F(PersistTest, TtlsDoNotDriftWhenTheWallClockMovesBetweenReads) {
+  OpenOptions o = Options();
+  o.wall_now = [this] {  // ticks 1 ms every time it is read
+    wall_ += milliseconds(1);
+    return wall_;
+  };
+  auto db = Open(o);
+
+  WriteBatch batch;
+  batch.Set("a", "1", seconds(10)).Set("b", "2").Expire("b", seconds(20));
+  batch.Set("n", "5", seconds(40)).Incr("n");
+  ASSERT_TRUE(db->Write(batch).ok());
+  ASSERT_TRUE(db->Set("c", "3", seconds(30)).ok());
+  ASSERT_EQ(*db->Incr("c"), 4);  // keeps its TTL
+
+  EXPECT_EQ(db->GetTtl("a").remaining, seconds(10));
+  EXPECT_EQ(db->GetTtl("b").remaining, seconds(20));
+  EXPECT_EQ(db->GetTtl("n").remaining, seconds(40));
+  EXPECT_EQ(db->GetTtl("c").remaining, seconds(30));
+
+  ASSERT_TRUE(db->Compact().ok());  // and compaction keeps them as they were
+  EXPECT_EQ(db->GetTtl("a").remaining, seconds(10));
+  EXPECT_EQ(db->GetTtl("n").remaining, seconds(40));
+}
+
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
   {
     auto db = Open();
