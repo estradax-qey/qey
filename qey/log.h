@@ -46,6 +46,13 @@ inline constexpr uint32_t kLogFormatVersion = 1;
 // Upper bound on a record's body (type byte plus payload).
 inline constexpr uint32_t kMaxRecordLength = 512u << 20;
 
+// Returns the bytes of the log header.
+std::string EncodeHeader();
+
+// Appends the encoded form of `record` to `out`. Fails with kInvalidArgument,
+// leaving `out` unchanged, if the record is malformed or too large.
+Status EncodeRecord(const Record& record, std::string* out);
+
 // Appends the log header. Call once on an empty file.
 Status WriteHeader(File& file);
 

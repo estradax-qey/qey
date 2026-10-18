@@ -31,12 +31,21 @@ class PosixFile : public File {
   Status Truncate(uint64_t size) override;
   uint64_t Size() const override { return size_; }
 
+  // Takes an exclusive advisory lock on the file, held until it is closed.
+  // Fails with kUnavailable if another open file description holds it, which
+  // includes another PosixFile for the same path in this process.
+  Status Lock();
+
  private:
   PosixFile(int fd, uint64_t size) : fd_(fd), size_(size) {}
 
   int fd_;
   uint64_t size_;
 };
+
+// Flushes the directory that contains `path`, making a newly created or
+// renamed entry durable.
+Status SyncDirectory(const std::string& path);
 
 }  // namespace qey
 

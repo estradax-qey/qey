@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <random>
@@ -31,7 +32,9 @@ class PersistTest : public testing::Test {
   }
 
   StatusOr<std::unique_ptr<Db>> TryOpen(OpenOptions o) {
-    return Db::Open(std::make_unique<FileRef>(&file_), std::move(o));
+    auto storage = std::make_unique<MemStorage>(&file_);
+    storage_ = storage.get();
+    return Db::Open(std::move(storage), std::move(o));
   }
 
   std::unique_ptr<Db> Open(OpenOptions o) {
@@ -57,6 +60,7 @@ class PersistTest : public testing::Test {
   std::chrono::system_clock::time_point wall_ =
       std::chrono::system_clock::time_point(seconds(1700000000));
   MemFile file_;
+  MemStorage* storage_ = nullptr;  // Valid while the Db from TryOpen lives.
 };
 
 TEST_F(PersistTest, NewFileGetsHeaderAndSync) {
@@ -340,14 +344,22 @@ TEST_F(PersistTest, MidFileCorruptionFailsOpenWithoutModifyingFile) {
 TEST_F(PersistTest, OpenRejectsForeignFileAndNullFile) {
   file_.data() = "this is not a qey database file";
   EXPECT_EQ(TryOpen(Options()).status().code(), StatusCode::kCorruption);
-  EXPECT_EQ(Db::Open(std::unique_ptr<File>()).status().code(),
+  EXPECT_EQ(Db::Open(std::unique_ptr<Storage>()).status().code(),
             StatusCode::kInvalidArgument);
 }
 
 // Runs random operations against a persistent Db and an in-memory Db in
 // lockstep, then checks that reopening the log reproduces the same state.
 TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
-  for (uint32_t seed = 1; seed <= 5; ++seed) {
+  for (uint32_t seed = 1; seed <= 10; ++seed) {
+    // Odd seeds compact constantly, so replay covers compacted logs.
+    OpenOptions options = Options();
+    if (seed % 2 == 1) {
+      options.compact_min_bytes = 64;
+      options.compact_ratio = 2;
+    } else {
+      options.auto_compact = false;
+    }
     file_ = MemFile();
     steady_ = Db::Clock::time_point(seconds(1000));
     wall_ = std::chrono::system_clock::time_point(seconds(1700000000));
@@ -356,13 +368,13 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
     auto pick = [&](int n) { return static_cast<int>(rng() % n); };
     auto key = [&] { return "k" + std::to_string(pick(8)); };
 
-    auto persistent = Open();
+    auto persistent = Open(options);
     Db reference([this] { return steady_; });
     ASSERT_NE(persistent, nullptr);
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(7)) {
+      switch (pick(8)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -396,6 +408,9 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
         case 6:
           Advance(milliseconds(pick(20)));
           break;
+        case 7:
+          if (pick(10) == 0) ASSERT_TRUE(persistent->Compact().ok());
+          break;
       }
     }
 
@@ -414,6 +429,167 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
       }
     }
   }
+}
+
+TEST_F(PersistTest, CompactShrinksLogToLiveData) {
+  auto db = Open();
+  for (int i = 0; i < 100; ++i)
+    ASSERT_TRUE(db->Set("a", std::to_string(i)).ok());
+  ASSERT_TRUE(db->Set("b", "1").ok());
+  ASSERT_TRUE(*db->Del("b"));
+  ASSERT_TRUE(db->Set("t", "v", seconds(5)).ok());
+  ASSERT_TRUE(db->Set("gone", "x", seconds(1)).ok());
+  Advance(seconds(2));  // "gone" expires, but is still in memory
+  const uint64_t before = file_.Size();
+  ASSERT_EQ(db->Size(), 3);
+
+  ASSERT_TRUE(db->Compact().ok());
+  EXPECT_LT(file_.Size(), before / 10);
+  // Header, then "a" (28 bytes) and "t" (27 bytes). "gone" is dropped.
+  EXPECT_EQ(file_.Size(), kLogHeaderSize + 28 + 27);
+  EXPECT_EQ(db->Size(), 2);  // expired key swept from memory too
+
+  ASSERT_TRUE(db->Set("after", "1").ok());  // appends to the new log
+  db.reset();
+  db = Open();
+  EXPECT_EQ(db->recovery_info().records_replayed, 3);
+  EXPECT_EQ(db->Get("a"), "99");
+  EXPECT_EQ(db->Get("after"), "1");
+  EXPECT_EQ(db->GetTtl("t").remaining, seconds(3));
+}
+
+TEST_F(PersistTest, AutoCompactionKeepsLogBounded) {
+  OpenOptions o = Options();
+  o.compact_min_bytes = 200;
+  o.compact_ratio = 2;
+  auto db = Open(o);
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_TRUE(db->Set("k", std::to_string(i)).ok());
+    ASSERT_LT(file_.Size(), 300) << "i=" << i;
+  }
+  EXPECT_GT(storage_->replace_count(), 0);
+  db.reset();
+  EXPECT_EQ(Open()->Get("k"), "199");
+}
+
+TEST_F(PersistTest, AutoCompactionCanBeDisabled) {
+  OpenOptions o = Options();
+  o.auto_compact = false;
+  o.compact_min_bytes = 200;
+  auto db = Open(o);
+  for (int i = 0; i < 200; ++i)
+    ASSERT_TRUE(db->Set("k", std::to_string(i)).ok());
+  EXPECT_EQ(storage_->replace_attempts(), 0);
+  EXPECT_GT(file_.Size(), 5000);
+}
+
+TEST_F(PersistTest, OpenCompactsAnOversizedLog) {
+  {
+    OpenOptions o = Options();
+    o.auto_compact = false;
+    auto db = Open(o);
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_TRUE(db->Set("k", std::to_string(i)).ok());
+    }
+  }
+  const uint64_t bloated = file_.Size();
+
+  OpenOptions o = Options();
+  o.compact_min_bytes = 100;
+  auto db = Open(o);
+  EXPECT_EQ(storage_->replace_count(), 1);
+  EXPECT_LT(file_.Size(), bloated / 10);
+  EXPECT_EQ(db->Get("k"), "199");
+
+  db.reset();
+  db = Open(o);  // already compact: nothing to do
+  EXPECT_EQ(storage_->replace_attempts(), 0);
+}
+
+TEST_F(PersistTest, FailedCompactionLeavesOldLogInUse) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  ASSERT_TRUE(db->Set("a", "2").ok());
+  const std::string before = file_.data();
+
+  storage_->FailReplaceBegin(true);
+  EXPECT_EQ(db->Compact().code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.data(), before);
+
+  storage_->FailReplaceBegin(false);
+  storage_->FailReplaceCommit(true);
+  EXPECT_EQ(db->Compact().code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.data(), before);
+
+  // The Db is still fully usable, and compaction works once the fault clears.
+  ASSERT_TRUE(db->Set("b", "3").ok());
+  storage_->FailReplaceCommit(false);
+  ASSERT_TRUE(db->Compact().ok());
+  db.reset();
+  db = Open();
+  EXPECT_EQ(db->Get("a"), "2");
+  EXPECT_EQ(db->Get("b"), "3");
+}
+
+TEST_F(PersistTest, FailedAutoCompactionDoesNotFailWritesOrRetryEveryTime) {
+  OpenOptions o = Options();
+  o.compact_min_bytes = 1000;
+  auto db = Open(o);
+  storage_->FailReplaceBegin(true);
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db->Set("k", std::to_string(i)).ok()) << "i=" << i;
+  }
+  EXPECT_GE(storage_->replace_attempts(), 1);
+  EXPECT_LT(storage_->replace_attempts(), 10);
+  EXPECT_EQ(db->Get("k"), "99");
+}
+
+TEST_F(PersistTest, CompactOnInMemoryDbIsNoOp) {
+  Db db;
+  ASSERT_TRUE(db.Set("a", "1").ok());
+  EXPECT_TRUE(db.Compact().ok());
+  EXPECT_EQ(db.Get("a"), "1");
+}
+
+TEST(DbFileTest, SecondOpenOfSamePathIsRefused) {
+  const std::string path = testing::TempDir() + "/db_lock_test.qey";
+  std::remove(path.c_str());
+  {
+    StatusOr<std::unique_ptr<Db>> first = Db::Open(path);
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    StatusOr<std::unique_ptr<Db>> second = Db::Open(path);
+    ASSERT_FALSE(second.ok());
+    EXPECT_EQ(second.status().code(), StatusCode::kUnavailable);
+  }
+  EXPECT_TRUE(Db::Open(path).ok());  // released when the first Db closed
+  std::remove(path.c_str());
+}
+
+TEST(DbFileTest, CompactionOnRealFileKeepsDataAndLock) {
+  const std::string path = testing::TempDir() + "/db_compact_test.qey";
+  std::remove(path.c_str());
+  {
+    StatusOr<std::unique_ptr<Db>> db = Db::Open(path);
+    ASSERT_TRUE(db.ok()) << db.status().message();
+    for (int i = 0; i < 500; ++i) {
+      ASSERT_TRUE((*db)->Set("k", std::to_string(i)).ok());
+    }
+    const auto before = std::filesystem::file_size(path);
+    ASSERT_TRUE((*db)->Compact().ok());
+    EXPECT_LT(std::filesystem::file_size(path), before / 10);
+    EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+
+    // Still locked after the file was swapped, and still writable.
+    EXPECT_EQ(Db::Open(path).status().code(), StatusCode::kUnavailable);
+    ASSERT_TRUE((*db)->Set("after", "compaction").ok());
+  }
+  StatusOr<std::unique_ptr<Db>> db = Db::Open(path);
+  ASSERT_TRUE(db.ok()) << db.status().message();
+  EXPECT_EQ((*db)->Get("k"), "499");
+  EXPECT_EQ((*db)->Get("after"), "compaction");
+  EXPECT_EQ((*db)->recovery_info().records_replayed, 2);
+  db = StatusOr<std::unique_ptr<Db>>(Status(StatusCode::kIoError, "closed"));
+  std::remove(path.c_str());
 }
 
 TEST(DbFileTest, OpensRealFileAndPersistsAcrossReopen) {

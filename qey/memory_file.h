@@ -3,12 +3,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 
 #include "qey/file.h"
 #include "qey/status.h"
+#include "qey/storage.h"
 
 namespace qey {
 
@@ -47,26 +49,47 @@ class MemFile : public File {
   bool fail_truncates_ = false;
 };
 
-// A File that forwards to another File without owning it. Lets a test hand a
-// File to code that takes ownership, while keeping access to the underlying
-// MemFile, e.g. to reopen a database on the same bytes. `target` must outlive
-// this object.
-class FileRef : public File {
+// A Storage over a MemFile that the test keeps ownership of, so the test can
+// inspect it and reopen a database on the same bytes. With fault injection.
+// `file` must outlive this object.
+class MemStorage : public Storage {
  public:
-  explicit FileRef(File* target) : target_(target) {}
+  explicit MemStorage(MemFile* file) : file_(file) {}
 
-  StatusOr<std::string> Read(uint64_t offset, size_t n) override {
-    return target_->Read(offset, n);
+  File& log() override { return *file_; }
+
+  // Builds the replacement in memory and swaps it in with one assignment, so
+  // it is all-or-nothing.
+  Status Replace(const std::function<Status(File&)>& fill) override {
+    ++replace_attempts_;
+    if (fail_replace_begin_) {
+      return Status(StatusCode::kIoError, "injected failure creating file");
+    }
+    MemFile replacement;
+    Status s = fill(replacement);
+    if (!s.ok()) return s;
+    if (fail_replace_commit_) {
+      return Status(StatusCode::kIoError, "injected failure before swap");
+    }
+    file_->data() = std::move(replacement.data());
+    ++replace_count_;
+    return Status::Ok();
   }
-  Status Append(std::string_view data) override {
-    return target_->Append(data);
-  }
-  Status Sync() override { return target_->Sync(); }
-  Status Truncate(uint64_t size) override { return target_->Truncate(size); }
-  uint64_t Size() const override { return target_->Size(); }
+
+  // Makes Replace() fail before calling `fill`, or after it but before the
+  // swap. In both cases the old log is left untouched.
+  void FailReplaceBegin(bool fail) { fail_replace_begin_ = fail; }
+  void FailReplaceCommit(bool fail) { fail_replace_commit_ = fail; }
+
+  int replace_attempts() const { return replace_attempts_; }
+  int replace_count() const { return replace_count_; }
 
  private:
-  File* target_;
+  MemFile* file_;
+  bool fail_replace_begin_ = false;
+  bool fail_replace_commit_ = false;
+  int replace_attempts_ = 0;
+  int replace_count_ = 0;
 };
 
 }  // namespace qey

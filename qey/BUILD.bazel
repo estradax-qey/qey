@@ -20,8 +20,9 @@ cc_library(
     deps = [
         ":file",
         ":log",
-        ":posix_file",
+        ":posix_storage",
         ":status",
+        ":storage",
     ],
     visibility = ["//visibility:public"],
 )
@@ -65,6 +66,7 @@ cc_library(
     deps = [
         ":file",
         ":status",
+        ":storage",
     ],
 )
 
@@ -118,6 +120,38 @@ cc_test(
         ":db",
         ":log",
         ":memory_file",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "storage",
+    hdrs = ["storage.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":file",
+        ":status",
+    ],
+)
+
+cc_library(
+    name = "posix_storage",
+    srcs = ["posix_storage.cc"],
+    hdrs = ["posix_storage.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":file",
+        ":posix_file",
+        ":status",
+        ":storage",
+    ],
+)
+
+cc_test(
+    name = "posix_storage_test",
+    srcs = ["posix_storage_test.cc"],
+    deps = [
+        ":posix_storage",
         "@googletest//:gtest_main",
     ],
 )

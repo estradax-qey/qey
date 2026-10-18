@@ -30,6 +30,10 @@ class [[nodiscard]] Status {
   static Status Ok() { return Status(); }
 
   bool ok() const { return code_ == StatusCode::kOk; }
+
+  // Explicitly discards the status, for best-effort cleanup where a failure
+  // changes nothing the caller can act on.
+  void IgnoreError() const {}
   StatusCode code() const { return code_; }
   const std::string& message() const { return message_; }
 

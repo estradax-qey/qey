@@ -1,6 +1,7 @@
 #include "qey/posix_file.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -33,6 +34,8 @@ bool FullSync(int fd) {
   return ::fsync(fd) == 0;
 }
 
+}  // namespace
+
 Status SyncDirectory(const std::string& path) {
   std::filesystem::path dir = std::filesystem::path(path).parent_path();
   if (dir.empty()) dir = ".";
@@ -44,8 +47,6 @@ Status SyncDirectory(const std::string& path) {
   if (!ok) return IoError("sync directory " + dir.string(), err);
   return Status::Ok();
 }
-
-}  // namespace
 
 StatusOr<std::unique_ptr<PosixFile>> PosixFile::Open(const std::string& path) {
   int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
@@ -112,6 +113,17 @@ Status PosixFile::Append(std::string_view data) {
     written += static_cast<size_t>(w);
   }
   size_ += written;
+  return Status::Ok();
+}
+
+Status PosixFile::Lock() {
+  if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+    if (errno == EWOULDBLOCK) {
+      return Status(StatusCode::kUnavailable,
+                    "file is locked by another handle or process");
+    }
+    return IoError("lock", errno);
+  }
   return Status::Ok();
 }
 

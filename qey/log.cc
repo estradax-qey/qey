@@ -68,14 +68,6 @@ class PayloadReader {
   std::string_view data_;
 };
 
-std::string EncodeHeader() {
-  std::string h;
-  h.append("QEYDB\0\0\1", 8);
-  PutU32(&h, kLogFormatVersion);
-  PutU32(&h, 0);  // Reserved.
-  return h;
-}
-
 bool HasExpiry(Record::Type type) {
   return type == Record::Type::kSet || type == Record::Type::kExpire;
 }
@@ -126,9 +118,17 @@ StatusOr<bool> AllZero(File& file, uint64_t offset, uint64_t n) {
 
 }  // namespace
 
+std::string EncodeHeader() {
+  std::string h;
+  h.append("QEYDB\0\0\1", 8);
+  PutU32(&h, kLogFormatVersion);
+  PutU32(&h, 0);  // Reserved.
+  return h;
+}
+
 Status WriteHeader(File& file) { return file.Append(EncodeHeader()); }
 
-Status AppendRecord(File& file, const Record& record) {
+Status EncodeRecord(const Record& record, std::string* out) {
   if (record.type < Record::Type::kSet ||
       record.type > Record::Type::kPersist) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
@@ -151,11 +151,17 @@ Status AppendRecord(File& file, const Record& record) {
     return Status(StatusCode::kInvalidArgument, "record too large");
   }
 
+  out->reserve(out->size() + kFrameHeaderSize + body.size());
+  PutU32(out, static_cast<uint32_t>(body.size()));
+  PutU32(out, Crc32(body));
+  out->append(body);
+  return Status::Ok();
+}
+
+Status AppendRecord(File& file, const Record& record) {
   std::string frame;
-  frame.reserve(kFrameHeaderSize + body.size());
-  PutU32(&frame, static_cast<uint32_t>(body.size()));
-  PutU32(&frame, Crc32(body));
-  frame.append(body);
+  Status s = EncodeRecord(record, &frame);
+  if (!s.ok()) return s;
   return file.Append(frame);
 }
 

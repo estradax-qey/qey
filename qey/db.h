@@ -18,6 +18,7 @@
 #include "qey/file.h"
 #include "qey/log.h"
 #include "qey/status.h"
+#include "qey/storage.h"
 
 namespace qey {
 
@@ -33,6 +34,15 @@ struct OpenOptions {
   SyncPolicy sync = SyncPolicy::kAlways;
   // What to do about a damaged tail of the log. See Replay().
   Recovery recovery = Recovery::kTruncate;
+  // Compaction rewrites the log to hold only live data, dropping overwritten
+  // and deleted records. When enabled, it runs on its own before a write once
+  // the log is larger than `compact_min_bytes` and `compact_ratio` times its
+  // size after the last compaction (or the size of the live data, at open).
+  // It blocks other callers while it runs. A failed automatic compaction is
+  // ignored, since it does not affect the write; call Compact() to see errors.
+  bool auto_compact = true;
+  uint64_t compact_min_bytes = 4u << 20;
+  uint32_t compact_ratio = 2;
   // Clock overrides, for tests. Empty means the real clocks.
   std::function<std::chrono::steady_clock::time_point()> now;
   std::function<std::chrono::system_clock::time_point()> wall_now;
@@ -85,13 +95,15 @@ class Db {
   explicit Db(NowFn now);
 
   // Opens the persistent store at `path`, creating it if it does not exist,
-  // and loads its contents. Fails with kCorruption if the log is damaged
-  // beyond a torn tail (see Replay()), or kIoError if the file cannot be used.
+  // and loads its contents. The file is locked until the Db is destroyed.
+  // Fails with kUnavailable if it is already open, kCorruption if the log is
+  // damaged beyond a torn tail (see Replay()), or kIoError if the file cannot
+  // be used.
   static StatusOr<std::unique_ptr<Db>> Open(std::string_view path,
                                             OpenOptions options = {});
 
-  // Like Open(path), but on an already open `file`, which the Db takes over.
-  static StatusOr<std::unique_ptr<Db>> Open(std::unique_ptr<File> file,
+  // Like Open(path), but on custom `storage`, which the Db takes over.
+  static StatusOr<std::unique_ptr<Db>> Open(std::unique_ptr<Storage> storage,
                                             OpenOptions options = {});
 
   Db(const Db&) = delete;
@@ -140,6 +152,11 @@ class Db {
   // Reports the expiry state of `key`.
   TtlInfo GetTtl(std::string_view key);
 
+  // Rewrites the log to hold only the live keys, then removes expired keys
+  // from memory. The log is replaced atomically: if this fails, the old log
+  // is intact and in use. Does nothing for an in-memory Db.
+  Status Compact();
+
   // Flushes the log to stable storage. Needed only with SyncPolicy::kManual.
   // Does nothing for an in-memory Db.
   Status Sync();
@@ -159,6 +176,17 @@ class Db {
 
   // Replays the log into memory and repairs its tail. Used by Open().
   Status Recover(Recovery recovery);
+
+  // Compacts the log if it has outgrown the thresholds in `options_`. Call
+  // before looking anything up, while memory and log agree. Requires `mu_`.
+  void MaybeCompactLocked();
+
+  // Rewrites the log from memory, omitting expired keys. Requires `mu_` held.
+  Status CompactLocked();
+
+  // Sets the size at which the next automatic compaction happens, given the
+  // log size right after a compaction (or the live data size).
+  void SetCompactThreshold(uint64_t base_size);
 
   // Appends `record` to the log and syncs it according to the policy. Does
   // nothing without a log. Requires `mu_` held.
@@ -192,8 +220,9 @@ class Db {
   NowFn now_;
   WallNowFn wall_now_;
   std::mutex mu_;
-  std::unique_ptr<File> file_;  // Null for an in-memory Db.
-  SyncPolicy sync_ = SyncPolicy::kAlways;
+  std::unique_ptr<Storage> storage_;  // Null for an in-memory Db.
+  OpenOptions options_;
+  uint64_t compact_threshold_ = 0;
   bool failed_ = false;  // A log write failed and could not be undone.
   RecoveryInfo recovery_info_;
   Map map_;

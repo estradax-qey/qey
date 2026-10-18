@@ -15,8 +15,9 @@
 
 #include "qey/file.h"
 #include "qey/log.h"
-#include "qey/posix_file.h"
+#include "qey/posix_storage.h"
 #include "qey/status.h"
+#include "qey/storage.h"
 
 namespace qey {
 
@@ -30,60 +31,73 @@ Db::Db(NowFn now, WallNowFn wall_now)
 
 StatusOr<std::unique_ptr<Db>> Db::Open(std::string_view path,
                                        OpenOptions options) {
-  StatusOr<std::unique_ptr<PosixFile>> file =
-      PosixFile::Open(std::string(path));
-  if (!file.ok()) return file.status();
-  return Open(std::unique_ptr<File>(*std::move(file)), std::move(options));
+  StatusOr<std::unique_ptr<PosixStorage>> storage =
+      PosixStorage::Open(std::string(path));
+  if (!storage.ok()) return storage.status();
+  return Open(std::unique_ptr<Storage>(*std::move(storage)),
+              std::move(options));
 }
 
-StatusOr<std::unique_ptr<Db>> Db::Open(std::unique_ptr<File> file,
+StatusOr<std::unique_ptr<Db>> Db::Open(std::unique_ptr<Storage> storage,
                                        OpenOptions options) {
-  if (file == nullptr) {
-    return Status(StatusCode::kInvalidArgument, "file is null");
+  if (storage == nullptr) {
+    return Status(StatusCode::kInvalidArgument, "storage is null");
   }
+  options.compact_ratio = std::max<uint32_t>(options.compact_ratio, 1);
   NowFn now = options.now ? std::move(options.now) : NowFn(&Clock::now);
   WallNowFn wall_now =
       options.wall_now
           ? std::move(options.wall_now)
           : WallNowFn([] { return std::chrono::system_clock::now(); });
   std::unique_ptr<Db> db(new Db(std::move(now), std::move(wall_now)));
-  db->file_ = std::move(file);
-  db->sync_ = options.sync;
+  db->storage_ = std::move(storage);
+  db->options_ = options;
   Status s = db->Recover(options.recovery);
   if (!s.ok()) return s;
   return StatusOr<std::unique_ptr<Db>>(std::move(db));
 }
 
 Status Db::Recover(Recovery recovery) {
-  StatusOr<ReplayResult> replay = Replay(*file_, recovery, [this](Record&& r) {
-    ApplyRecordLocked(std::move(r));
-  });
+  StatusOr<ReplayResult> replay =
+      Replay(storage_->log(), recovery,
+             [this](Record&& r) { ApplyRecordLocked(std::move(r)); });
   if (!replay.ok()) return replay.status();
 
   if (replay->valid_size == 0) {
     // A new file, or one whose header write was torn.
-    if (file_->Size() > 0) {
-      Status s = file_->Truncate(0);
+    File& log = storage_->log();
+    if (log.Size() > 0) {
+      Status s = log.Truncate(0);
       if (!s.ok()) return s;
     }
-    Status s = WriteHeader(*file_);
-    if (s.ok()) s = file_->Sync();
+    Status s = WriteHeader(log);
+    if (s.ok()) s = log.Sync();
     if (!s.ok()) return s;
   } else if (replay->dropped_bytes > 0) {
-    Status s = file_->Truncate(replay->valid_size);
-    if (s.ok()) s = file_->Sync();
+    File& log = storage_->log();
+    Status s = log.Truncate(replay->valid_size);
+    if (s.ok()) s = log.Sync();
     if (!s.ok()) return s;
   }
 
   recovery_info_.records_replayed = replay->records;
   recovery_info_.dropped_bytes = replay->dropped_bytes;
   Sweep();  // Drop keys that expired while the store was closed.
+
+  // A log much bigger than the data in it is compacted right away.
+  uint64_t live_bytes = kLogHeaderSize;
+  for (const auto& [key, entry] : map_) {
+    live_bytes += 8 + 1 + 4 + key.size() + 4 + entry.value.size() + 8;
+  }
+  SetCompactThreshold(live_bytes);
+  MaybeCompactLocked();
   return Status::Ok();
 }
 
 Status Db::Set(std::string_view key, std::string_view value,
                std::optional<std::chrono::milliseconds> ttl) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   std::optional<Clock::time_point> expires_at;
   if (ttl.has_value()) expires_at = now_() + *ttl;
 
@@ -109,6 +123,7 @@ std::optional<std::string> Db::Get(std::string_view key) {
 
 StatusOr<bool> Db::Del(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   auto it = FindLive(key);
   if (it == map_.end()) return false;
   Status s = LogLocked(Record{Record::Type::kDel, std::string(key), "", {}});
@@ -119,11 +134,13 @@ StatusOr<bool> Db::Del(std::string_view key) {
 
 StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   return AddLocked(key, delta, /*subtract=*/false);
 }
 
 StatusOr<int64_t> Db::Decr(std::string_view key, int64_t delta) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   return AddLocked(key, delta, /*subtract=*/true);
 }
 
@@ -152,6 +169,7 @@ bool Db::Exists(std::string_view key) {
 
 StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   auto it = FindLive(key);
   if (it == map_.end()) return false;
   const Clock::time_point at = now_() + ttl;
@@ -164,6 +182,7 @@ StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
 
 StatusOr<bool> Db::Persist(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
   auto it = FindLive(key);
   if (it == map_.end() || !it->second.expires_at.has_value()) return false;
   Status s =
@@ -175,11 +194,11 @@ StatusOr<bool> Db::Persist(std::string_view key) {
 
 Status Db::Sync() {
   std::lock_guard<std::mutex> lock(mu_);
-  if (file_ == nullptr) return Status::Ok();
+  if (storage_ == nullptr) return Status::Ok();
   if (failed_) {
     return Status(StatusCode::kIoError, "database failed after an I/O error");
   }
-  Status s = file_->Sync();
+  Status s = storage_->log().Sync();
   if (!s.ok()) failed_ = true;
   return s;
 }
@@ -238,20 +257,21 @@ StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
 }
 
 Status Db::LogLocked(const Record& record) {
-  if (file_ == nullptr) return Status::Ok();
+  if (storage_ == nullptr) return Status::Ok();
   if (failed_) {
     return Status(StatusCode::kIoError, "database failed after an I/O error");
   }
 
-  const uint64_t size_before = file_->Size();
-  Status s = AppendRecord(*file_, record);
+  File& log = storage_->log();
+  const uint64_t size_before = log.Size();
+  Status s = AppendRecord(log, record);
   if (!s.ok()) {
     // Remove any partial record so that later appends do not follow garbage.
-    if (!file_->Truncate(size_before).ok()) failed_ = true;
+    if (!log.Truncate(size_before).ok()) failed_ = true;
     return s;
   }
-  if (sync_ == SyncPolicy::kAlways) {
-    s = file_->Sync();
+  if (options_.sync == SyncPolicy::kAlways) {
+    s = log.Sync();
     if (!s.ok()) {
       // The record may or may not have reached the disk. Memory has not been
       // updated, so stop accepting writes rather than let the two diverge.
@@ -260,6 +280,65 @@ Status Db::LogLocked(const Record& record) {
     }
   }
   return Status::Ok();
+}
+
+Status Db::Compact() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (storage_ == nullptr) return Status::Ok();
+  if (failed_) {
+    return Status(StatusCode::kIoError, "database failed after an I/O error");
+  }
+  Status s = CompactLocked();
+  if (s.ok()) {
+    // Nothing is iterating the map here, so expired keys can go.
+    const Clock::time_point now = now_();
+    while (!expiry_.empty() && expiry_.begin()->first <= now) {
+      EraseLocked(map_.find(expiry_.begin()->second));
+    }
+  }
+  return s;
+}
+
+void Db::MaybeCompactLocked() {
+  if (storage_ == nullptr || failed_ || !options_.auto_compact) return;
+  const uint64_t size = storage_->log().Size();
+  if (size <= compact_threshold_) return;
+  if (!CompactLocked().ok()) {
+    // Do not retry on every write; try again after the log has grown more.
+    compact_threshold_ = size + options_.compact_min_bytes;
+  }
+}
+
+Status Db::CompactLocked() {
+  const Clock::time_point now = now_();
+  Status s = storage_->Replace([&](File& out) -> Status {
+    // Batch records so that a big database is not written one call per key.
+    constexpr size_t kFlushBytes = 1 << 20;
+    std::string buf = EncodeHeader();
+    for (const auto& [key, entry] : map_) {
+      if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
+      Record record{Record::Type::kSet, key, entry.value, std::nullopt};
+      if (entry.expires_at.has_value()) {
+        record.expires_at_ms = ToWallMs(*entry.expires_at);
+      }
+      Status encoded = EncodeRecord(record, &buf);
+      if (!encoded.ok()) return encoded;
+      if (buf.size() >= kFlushBytes) {
+        Status written = out.Append(buf);
+        if (!written.ok()) return written;
+        buf.clear();
+      }
+    }
+    return out.Append(buf);
+  });
+  if (!s.ok()) return s;
+  SetCompactThreshold(storage_->log().Size());
+  return Status::Ok();
+}
+
+void Db::SetCompactThreshold(uint64_t base_size) {
+  compact_threshold_ = std::max<uint64_t>(options_.compact_min_bytes,
+                                          base_size * options_.compact_ratio);
 }
 
 void Db::ApplyRecordLocked(Record&& record) {
