@@ -2,12 +2,15 @@
 #define QEY_DB_H_
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+
+#include "qey/status.h"
 
 namespace qey {
 
@@ -52,6 +55,16 @@ class Db {
   // Removes `key`. Returns true if a live key was removed.
   bool Del(std::string_view key);
 
+  // Adds `delta` to the integer stored at `key` and returns the new value. A
+  // missing key is treated as 0. The key's TTL is preserved. Fails with
+  // kNotInteger if the stored value is not a base-10 64-bit integer, or
+  // kOutOfRange if the result overflows; the stored value is unchanged on
+  // failure.
+  StatusOr<int64_t> Incr(std::string_view key, int64_t delta = 1);
+
+  // Like Incr(), but subtracts `delta`.
+  StatusOr<int64_t> Decr(std::string_view key, int64_t delta = 1);
+
   // Returns true if `key` exists and has not expired.
   bool Exists(std::string_view key);
 
@@ -76,6 +89,10 @@ class Db {
   // Returns an iterator to the live entry for `key`, erasing it first if it
   // has expired. Returns map_.end() if there is none. Requires `mu_` held.
   Map::iterator FindLive(std::string_view key);
+
+  // Implements Incr() and Decr(). Requires `mu_` held.
+  StatusOr<int64_t> AddLocked(std::string_view key, int64_t delta,
+                              bool subtract);
 
   NowFn now_;
   std::mutex mu_;

@@ -1,6 +1,8 @@
 #include "qey/db.h"
 
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -36,6 +38,16 @@ bool Db::Del(std::string_view key) {
   return true;
 }
 
+StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return AddLocked(key, delta, /*subtract=*/false);
+}
+
+StatusOr<int64_t> Db::Decr(std::string_view key, int64_t delta) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return AddLocked(key, delta, /*subtract=*/true);
+}
+
 bool Db::Exists(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
   return FindLive(key) != map_.end();
@@ -66,6 +78,40 @@ Db::TtlInfo Db::GetTtl(std::string_view key) {
   return {TtlState::kExpiring,
           std::chrono::duration_cast<std::chrono::milliseconds>(
               *expires_at - now_())};
+}
+
+StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
+                                bool subtract) {
+  auto it = FindLive(key);
+  int64_t current = 0;
+  if (it != map_.end()) {
+    const std::string& s = it->second.value;
+    const char* end = s.data() + s.size();
+    auto [ptr, ec] = std::from_chars(s.data(), end, current);
+    if (ec == std::errc::result_out_of_range) {
+      return Status(StatusCode::kNotInteger, "value is out of int64 range");
+    }
+    if (ec != std::errc() || ptr != end) {
+      return Status(StatusCode::kNotInteger, "value is not an integer");
+    }
+  }
+
+  int64_t result;
+  bool overflow = subtract ? __builtin_sub_overflow(current, delta, &result)
+                           : __builtin_add_overflow(current, delta, &result);
+  if (overflow) {
+    return Status(StatusCode::kOutOfRange,
+                  "increment or decrement would overflow");
+  }
+
+  std::string text = std::to_string(result);
+  if (it != map_.end()) {
+    it->second.value = std::move(text);
+  } else {
+    map_.insert_or_assign(std::string(key),
+                          Entry{std::move(text), std::nullopt});
+  }
+  return result;
 }
 
 Db::Map::iterator Db::FindLive(std::string_view key) {

@@ -1,7 +1,23 @@
 cc_library(
+    name = "status",
+    hdrs = ["status.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "status_test",
+    srcs = ["status_test.cc"],
+    deps = [
+        ":status",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "db",
     srcs = ["db.cc"],
     hdrs = ["db.h"],
+    deps = [":status"],
     visibility = ["//visibility:public"],
 )
 

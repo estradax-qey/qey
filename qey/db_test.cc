@@ -1,6 +1,8 @@
 #include "qey/db.h"
 
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "gtest/gtest.h"
@@ -134,6 +136,69 @@ TEST_F(DbTest, GetTtlReportsState) {
 
   Advance(milliseconds(70));
   EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kMissing);
+}
+
+TEST_F(DbTest, IncrOnMissingKeyStartsAtZero) {
+  StatusOr<int64_t> r = db_.Incr("n");
+  ASSERT_TRUE(r.ok());
+  EXPECT_EQ(*r, 1);
+  EXPECT_EQ(db_.Get("n"), "1");
+}
+
+TEST_F(DbTest, IncrAndDecrApplyDelta) {
+  db_.Set("n", "10");
+  EXPECT_EQ(*db_.Incr("n", 5), 15);
+  EXPECT_EQ(*db_.Decr("n", 20), -5);
+  EXPECT_EQ(*db_.Decr("n"), -6);
+  EXPECT_EQ(db_.Get("n"), "-6");
+}
+
+TEST_F(DbTest, IncrPreservesTtl) {
+  db_.Set("n", "1", milliseconds(100));
+  ASSERT_TRUE(db_.Incr("n").ok());
+  Advance(milliseconds(100));
+  EXPECT_FALSE(db_.Exists("n"));
+}
+
+TEST_F(DbTest, IncrOnExpiredKeyRestartsWithoutTtl) {
+  db_.Set("n", "41", milliseconds(100));
+  Advance(milliseconds(100));
+  EXPECT_EQ(*db_.Incr("n"), 1);
+  EXPECT_EQ(db_.GetTtl("n").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, IncrRejectsNonIntegerValues) {
+  for (const char* bad : {"", "abc", "1.5", " 1", "1 ", "+1", "0x10"}) {
+    db_.Set("n", bad);
+    StatusOr<int64_t> r = db_.Incr("n");
+    EXPECT_FALSE(r.ok()) << bad;
+    EXPECT_EQ(r.status().code(), StatusCode::kNotInteger) << bad;
+    EXPECT_EQ(db_.Get("n"), bad);
+  }
+}
+
+TEST_F(DbTest, IncrRejectsValueOutsideInt64) {
+  db_.Set("n", "99999999999999999999");
+  EXPECT_EQ(db_.Incr("n").status().code(), StatusCode::kNotInteger);
+}
+
+TEST_F(DbTest, IncrDetectsOverflow) {
+  constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+  db_.Set("n", std::to_string(kMax));
+  StatusOr<int64_t> r = db_.Incr("n");
+  EXPECT_EQ(r.status().code(), StatusCode::kOutOfRange);
+  EXPECT_EQ(db_.Get("n"), std::to_string(kMax));
+}
+
+TEST_F(DbTest, DecrDetectsUnderflowAndHandlesInt64Min) {
+  constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+  db_.Set("n", std::to_string(kMin));
+  EXPECT_EQ(db_.Decr("n").status().code(), StatusCode::kOutOfRange);
+
+  db_.Set("n", "-1");
+  StatusOr<int64_t> r = db_.Decr("n", kMin);
+  ASSERT_TRUE(r.ok());
+  EXPECT_EQ(*r, std::numeric_limits<int64_t>::max());
 }
 
 TEST_F(DbTest, DefaultClockConstructs) {
