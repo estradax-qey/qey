@@ -90,9 +90,17 @@ bad CRC.
   `Db::recovery_info()`.
 - `Recovery::kStrict`: fail with `kCorruption` instead.
 
-A bad record that is followed by more valid-looking data is not the
-signature of a torn tail. In that case `Open` fails with `kCorruption` even
-under `kTruncate`, rather than discarding good data after the damage.
+Damage counts as a torn tail only where a crash during an append could leave
+it: a header or record cut short by the end of the file, a final record that
+fails its checksum, or a zero-filled tail (left by some file systems). Any
+other damage, such as a checksum failure with more data after the record,
+makes `Open` fail with `kCorruption` even under `kTruncate`, rather than
+discarding good data after the damage.
+
+Known limitation: a corrupted length field that points past the end of the
+file looks exactly like a record cut short, so everything from that record on
+is treated as a torn tail and dropped. `recovery_info()` reports the dropped
+byte count so callers can notice an unexpectedly large loss.
 
 ## Compaction
 
