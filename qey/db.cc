@@ -29,6 +29,34 @@ Status CheckTtl(std::chrono::milliseconds ttl) {
   return Status::Ok();
 }
 
+// Returns `*current + delta` (or minus) where `current` is null for a missing
+// key, which counts as 0. Fails if the value is not an integer or the result
+// does not fit.
+StatusOr<int64_t> Added(const std::string* current_value, int64_t delta,
+                        bool subtract) {
+  int64_t current = 0;
+  if (current_value != nullptr) {
+    const std::string& s = *current_value;
+    const char* end = s.data() + s.size();
+    auto [ptr, ec] = std::from_chars(s.data(), end, current);
+    if (ec == std::errc::result_out_of_range) {
+      return Status(StatusCode::kNotInteger, "value is out of int64 range");
+    }
+    if (ec != std::errc() || ptr != end) {
+      return Status(StatusCode::kNotInteger, "value is not an integer");
+    }
+  }
+
+  int64_t result;
+  bool overflow = subtract ? __builtin_sub_overflow(current, delta, &result)
+                           : __builtin_add_overflow(current, delta, &result);
+  if (overflow) {
+    return Status(StatusCode::kOutOfRange,
+                  "increment or decrement would overflow");
+  }
+  return result;
+}
+
 Status CheckKey(std::string_view key) {
   if (key.size() > Db::kMaxKeySize) {
     return Status(StatusCode::kInvalidArgument,
@@ -303,6 +331,183 @@ StatusOr<bool> Db::Rename(std::string_view from, std::string_view to) {
   return true;
 }
 
+Status Db::Write(const WriteBatch& batch) {
+  if (batch.empty()) return Status::Ok();
+  // Everything that can be checked without looking at the data comes first,
+  // so that a bad batch is refused before anything is touched.
+  for (const WriteBatch::Op& op : batch.ops_) {
+    Status valid = CheckKey(op.key);
+    if (valid.ok() && op.type == WriteBatch::Op::Type::kRename) {
+      valid = CheckKey(op.arg);
+    }
+    if (valid.ok() && op.ttl.has_value()) valid = CheckTtl(*op.ttl);
+    if (valid.ok() && op.arg.size() > kMaxValueSize &&
+        op.type != WriteBatch::Op::Type::kRename) {
+      valid = Status(StatusCode::kInvalidArgument,
+                     "value is longer than kMaxValueSize");
+    }
+    if (!valid.ok()) return valid;
+  }
+
+  std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
+  if (storage_ != nullptr) {
+    Status healthy = CheckHealthyLocked();
+    if (!healthy.ok()) return healthy;
+  }
+
+  // Apply to memory as we go, so each change sees the ones before it, and
+  // keep what is needed to undo it. Nothing else can look at memory until the
+  // lock is released.
+  Undo undo;
+  std::vector<Record> effective;
+  for (const WriteBatch::Op& op : batch.ops_) {
+    Status s = StageLocked(op, &undo, &effective);
+    if (!s.ok()) {
+      RollbackLocked(undo);
+      return s;
+    }
+  }
+  if (effective.empty()) return Status::Ok();  // every change was a no-op
+
+  Record record;
+  if (effective.size() == 1) {
+    record = std::move(effective[0]);
+  } else {
+    record.type = Record::Type::kBatch;
+    record.records = std::move(effective);
+  }
+  Status s = LogLocked(record);
+  if (!s.ok()) {
+    RollbackLocked(undo);
+    return s;
+  }
+  return Status::Ok();
+}
+
+Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
+                       std::vector<Record>* effective) {
+  using Type = WriteBatch::Op::Type;
+
+  auto remember = [&](std::string_view key) {
+    if (undo->find(key) != undo->end()) return;
+    auto it = map_.find(key);
+    undo->emplace(std::string(key), it == map_.end()
+                                        ? std::nullopt
+                                        : std::optional<Entry>(it->second));
+  };
+  // Applies through the same code as replay, so a live batch and a recovered
+  // one cannot differ.
+  auto apply = [&](Record record) {
+    Record copy = record;
+    ApplyRecordLocked(std::move(copy));
+    effective->push_back(std::move(record));
+  };
+
+  switch (op.type) {
+    case Type::kSet: {
+      remember(op.key);
+      Record record{Record::Type::kSet, op.key, op.arg, std::nullopt};
+      if (op.ttl.has_value()) {
+        record.expires_at_ms = ToWallMs(now_() + ClampTtl(*op.ttl));
+      }
+      apply(std::move(record));
+      break;
+    }
+    case Type::kDel: {
+      if (FindLive(op.key) == map_.end()) break;
+      remember(op.key);
+      apply(Record{Record::Type::kDel, op.key, "", {}});
+      break;
+    }
+    case Type::kExpire: {
+      if (FindLive(op.key) == map_.end()) break;
+      remember(op.key);
+      apply(Record{Record::Type::kExpire, op.key, "",
+                   ToWallMs(now_() + ClampTtl(*op.ttl))});
+      break;
+    }
+    case Type::kPersist: {
+      auto it = FindLive(op.key);
+      if (it == map_.end() || !it->second.expires_at.has_value()) break;
+      remember(op.key);
+      apply(Record{Record::Type::kPersist, op.key, "", {}});
+      break;
+    }
+    case Type::kAppend: {
+      auto it = FindLive(op.key);
+      const size_t old_size = it == map_.end() ? 0 : it->second.value.size();
+      if (old_size > kMaxValueSize - op.arg.size()) {
+        return Status(StatusCode::kInvalidArgument,
+                      "value would be longer than kMaxValueSize");
+      }
+      remember(op.key);
+      // A new key is a plain SET, as in Append().
+      apply(
+          Record{it == map_.end() ? Record::Type::kSet : Record::Type::kAppend,
+                 op.key, op.arg, std::nullopt});
+      break;
+    }
+    case Type::kRename: {
+      if (FindLive(op.key) == map_.end() || op.key == op.arg) break;
+      FindLive(op.arg);  // drops an expired destination
+      remember(op.key);
+      remember(op.arg);
+      apply(Record{Record::Type::kRename, op.key, op.arg, {}});
+      break;
+    }
+    case Type::kIncr:
+    case Type::kDecr: {
+      auto it = FindLive(op.key);
+      StatusOr<int64_t> added =
+          Added(it == map_.end() ? nullptr : &it->second.value, op.delta,
+                op.type == Type::kDecr);
+      if (!added.ok()) return added.status();
+      Record record{Record::Type::kSet, op.key, std::to_string(*added),
+                    std::nullopt};
+      if (it != map_.end() && it->second.expires_at.has_value()) {
+        record.expires_at_ms = ToWallMs(*it->second.expires_at);
+      }
+      remember(op.key);
+      apply(std::move(record));
+      break;
+    }
+  }
+  return Status::Ok();
+}
+
+void Db::RollbackLocked(const Undo& undo) {
+  for (const auto& [key, original] : undo) {
+    auto it = map_.find(key);
+    if (!original.has_value()) {
+      if (it != map_.end()) EraseLocked(it);
+      continue;
+    }
+    if (it == map_.end()) it = InsertLocked(key);
+    ClearExpiryLocked(it);
+    it->second.value = original->value;
+    if (original->expires_at.has_value()) {
+      SetExpiryLocked(it, *original->expires_at);
+    }
+  }
+}
+
+std::vector<std::optional<std::string>> Db::MGet(
+    const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<std::optional<std::string>> values;
+  values.reserve(keys.size());
+  for (const std::string& key : keys) {
+    auto it = FindLive(key);
+    if (it == map_.end()) {
+      values.emplace_back(std::nullopt);
+    } else {
+      values.emplace_back(it->second.value);
+    }
+  }
+  return values;
+}
+
 Status Db::Clear() {
   std::lock_guard<std::mutex> lock(mu_);
   if (storage_ != nullptr) {
@@ -413,26 +618,10 @@ Db::TtlInfo Db::GetTtl(std::string_view key) {
 StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
                                 bool subtract) {
   auto it = FindLive(key);
-  int64_t current = 0;
-  if (it != map_.end()) {
-    const std::string& s = it->second.value;
-    const char* end = s.data() + s.size();
-    auto [ptr, ec] = std::from_chars(s.data(), end, current);
-    if (ec == std::errc::result_out_of_range) {
-      return Status(StatusCode::kNotInteger, "value is out of int64 range");
-    }
-    if (ec != std::errc() || ptr != end) {
-      return Status(StatusCode::kNotInteger, "value is not an integer");
-    }
-  }
-
-  int64_t result;
-  bool overflow = subtract ? __builtin_sub_overflow(current, delta, &result)
-                           : __builtin_add_overflow(current, delta, &result);
-  if (overflow) {
-    return Status(StatusCode::kOutOfRange,
-                  "increment or decrement would overflow");
-  }
+  StatusOr<int64_t> added =
+      Added(it == map_.end() ? nullptr : &it->second.value, delta, subtract);
+  if (!added.ok()) return added.status();
+  const int64_t result = *added;
 
   std::string text = std::to_string(result);
   // Log the resulting value, not the delta, so replay never redoes arithmetic.
@@ -582,6 +771,11 @@ void Db::ApplyRecordLocked(Record&& record) {
       }
       break;
     }
+    case Record::Type::kBatch:
+      for (Record& member : record.records) {
+        ApplyRecordLocked(std::move(member));
+      }
+      break;
   }
 }
 

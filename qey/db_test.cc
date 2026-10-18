@@ -1,11 +1,13 @@
 #include "qey/db.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -558,6 +560,186 @@ TEST_F(DbTest, KeyIndexStaysCurrentAfterItIsBuilt) {
   EXPECT_EQ(db_.Keys(), Keys{});
   Set("again", "v");
   EXPECT_EQ(db_.Keys(), Keys{"again"});
+}
+
+TEST_F(DbTest, BatchAppliesChangesInOrderEachSeeingTheLast) {
+  WriteBatch batch;
+  batch.Set("a", "1")
+      .Set("b", "2")
+      .Rename("a", "c")  // sees the Set above
+      .Append("c", "x")
+      .Del("b")
+      .Incr("n", 5)
+      .Incr("n")
+      .Decr("m", 3)
+      .Set("t", "v", milliseconds(100));
+  ASSERT_TRUE(db_.Write(batch).ok());
+
+  EXPECT_FALSE(db_.Exists("a"));
+  EXPECT_FALSE(db_.Exists("b"));
+  EXPECT_EQ(db_.Get("c"), "1x");
+  EXPECT_EQ(db_.Get("n"), "6");
+  EXPECT_EQ(db_.Get("m"), "-3");
+  EXPECT_EQ(db_.GetTtl("t").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Keys(), (Keys{"c", "m", "n", "t"}));
+}
+
+TEST_F(DbTest, BatchLastChangeToAKeyWins) {
+  Set("k", "old");
+  WriteBatch batch;
+  batch.Set("k", "one")
+      .Del("k")
+      .Set("k", "two", milliseconds(50))
+      .Set("k", "3");
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(db_.Get("k"), "3");
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, BatchExpireAndPersist) {
+  WriteBatch batch;
+  batch.Set("a", "1", milliseconds(50))
+      .Persist("a")
+      .Set("b", "2")
+      .Expire("b", milliseconds(50));
+  ASSERT_TRUE(db_.Write(batch).ok());
+  Advance(milliseconds(50));
+  EXPECT_TRUE(db_.Exists("a"));
+  EXPECT_FALSE(db_.Exists("b"));
+}
+
+TEST_F(DbTest, BatchChangesToMissingKeysAreNoOps) {
+  WriteBatch batch;
+  batch.Del("x").Expire("x", milliseconds(5)).Persist("x").Rename("x", "y");
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(db_.Size(), 0);
+}
+
+TEST_F(DbTest, EmptyBatchSucceedsAndABatchCanBeWrittenAgain) {
+  WriteBatch batch;
+  EXPECT_TRUE(batch.empty());
+  EXPECT_TRUE(db_.Write(batch).ok());
+
+  batch.Incr("n").Append("log", "x");
+  EXPECT_EQ(batch.size(), 2);
+  ASSERT_TRUE(db_.Write(batch).ok());
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(db_.Get("n"), "2");
+  EXPECT_EQ(db_.Get("log"), "xx");
+
+  batch.Clear();
+  EXPECT_TRUE(batch.empty());
+  EXPECT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(db_.Get("n"), "2");
+}
+
+TEST_F(DbTest, FailedBatchChangesNothing) {
+  Set("a", "va", milliseconds(100));
+  Set("b", "vb");
+  Set("text", "abc");
+  Set("dest", "old", milliseconds(30));
+  ASSERT_EQ(db_.Keys().size(), 4);  // builds the key index
+
+  WriteBatch batch;
+  batch.Set("new", "x")
+      .Set("a", "overwritten")
+      .Del("b")
+      .Rename("a", "dest")
+      .Expire("text", milliseconds(1))
+      .Set("later", "y", milliseconds(10))
+      .Incr("text");  // not an integer: fails the whole batch
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kNotInteger);
+
+  EXPECT_EQ(db_.Keys(), (Keys{"a", "b", "dest", "text"}));
+  EXPECT_EQ(db_.Size(), 4);
+  EXPECT_EQ(db_.Get("a"), "va");
+  EXPECT_EQ(db_.GetTtl("a").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Get("b"), "vb");
+  EXPECT_EQ(db_.GetTtl("b").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db_.Get("dest"), "old");
+  EXPECT_EQ(db_.GetTtl("dest").remaining, milliseconds(30));
+  EXPECT_EQ(db_.GetTtl("text").state, Db::TtlState::kNoExpiry);
+  EXPECT_FALSE(db_.Exists("new"));
+  EXPECT_FALSE(db_.Exists("later"));
+
+  // The expiry index was restored too: exactly "dest" then "a" expire.
+  Advance(milliseconds(30));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Keys(), (Keys{"a", "b", "text"}));
+  Advance(milliseconds(70));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Keys(), (Keys{"b", "text"}));
+}
+
+TEST_F(DbTest, BatchOverflowAbortsEverything) {
+  Set("n", std::to_string(std::numeric_limits<int64_t>::max()));
+  WriteBatch batch;
+  batch.Set("x", "1").Incr("n");
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kOutOfRange);
+  EXPECT_FALSE(db_.Exists("x"));
+
+  WriteBatch under;
+  Set("m", std::to_string(std::numeric_limits<int64_t>::min()));
+  under.Set("y", "1").Decr("m");
+  EXPECT_EQ(db_.Write(under).code(), StatusCode::kOutOfRange);
+  EXPECT_FALSE(db_.Exists("y"));
+}
+
+TEST_F(DbTest, BatchWithBadArgumentsIsRefusedBeforeAnythingChanges) {
+  const std::string big_key(Db::kMaxKeySize + 1, 'k');
+  for (const WriteBatch& bad : {
+           WriteBatch().Set("ok", "1").Set(big_key, "v"),
+           WriteBatch().Set("ok", "1").Rename("ok", big_key),
+           WriteBatch().Set("ok", "1").Incr(big_key),
+           WriteBatch().Set("ok", "1").Expire("ok", milliseconds::max()),
+           WriteBatch().Set("ok", "1").Set("z", "2", Db::kMaxTtl * 2),
+       }) {
+    EXPECT_EQ(db_.Write(bad).code(), StatusCode::kInvalidArgument);
+    EXPECT_FALSE(db_.Exists("ok"));
+  }
+}
+
+TEST_F(DbTest, BatchAppendRespectsTheValueLimit) {
+  std::string big(Db::kMaxValueSize, 'x');
+  ASSERT_TRUE(db_.Set("k", big).ok());
+  WriteBatch batch;
+  batch.Set("z", "1").Append("k", "y");
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("z"));
+}
+
+TEST_F(DbTest, MGetReadsValuesInOrderWithMissingAsNullopt) {
+  Set("a", "1");
+  Set("b", "2", milliseconds(10));
+  Set("c", "");
+  Advance(milliseconds(10));
+  using Values = std::vector<std::optional<std::string>>;
+  EXPECT_EQ(db_.MGet({"c", "a", "b", "nope", "a"}),
+            (Values{"", "1", std::nullopt, std::nullopt, "1"}));
+  EXPECT_EQ(db_.MGet({}), Values{});
+}
+
+TEST_F(DbTest, ConcurrentReadersNeverSeeAHalfAppliedBatch) {
+  std::atomic<bool> done{false};
+  std::atomic<int> torn_reads{0};
+  std::atomic<int> reads{0};
+  std::thread reader([&] {
+    while (!done) {
+      auto values = db_.MGet({"a", "b", "c"});
+      if (values[0] != values[1] || values[1] != values[2]) ++torn_reads;
+      ++reads;
+    }
+  });
+  for (int i = 0; i < 3000; ++i) {
+    const std::string v = std::to_string(i);
+    WriteBatch batch;
+    batch.Set("a", v).Set("b", v).Set("c", v);
+    ASSERT_TRUE(db_.Write(batch).ok());
+  }
+  done = true;
+  reader.join();
+  EXPECT_EQ(torn_reads, 0);
+  EXPECT_GT(reads, 0);
 }
 
 TEST_F(DbTest, DefaultClockConstructs) {

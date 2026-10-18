@@ -280,6 +280,154 @@ TEST_F(PersistTest, RejectedWritesLogNothing) {
   EXPECT_EQ(file_.Size(), size);
 }
 
+std::vector<std::string> KeysOf(Db& db) { return db.Keys(); }
+
+TEST_F(PersistTest, BatchSurvivesReopenAsOneRecord) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("old", "v").ok());
+    ASSERT_TRUE(db->Set("k", "1", seconds(100)).ok());
+    before = file_.Size();
+
+    WriteBatch batch;
+    batch.Set("a", "1").Set("b", "2").Del("old").Rename("k", "k2").Incr("n");
+    ASSERT_TRUE(db->Write(batch).ok());
+    // One frame (8) holding: type (1) + count (4) + 5 members, each with a
+    // length (4) and a body.
+    EXPECT_GT(file_.Size(), before);
+  }
+  Restart(seconds(10));
+  auto db = Open();
+  EXPECT_EQ(db->recovery_info().records_replayed, 3);  // 2 sets + 1 batch
+  EXPECT_EQ(KeysOf(*db), (std::vector<std::string>{"a", "b", "k2", "n"}));
+  EXPECT_EQ(db->Get("n"), "1");
+  EXPECT_EQ(db->GetTtl("k2").remaining, seconds(90));
+}
+
+TEST_F(PersistTest, OneEffectiveChangeIsLoggedAsAPlainRecord) {
+  auto db = Open();
+  const uint64_t before = file_.Size();
+  WriteBatch batch;
+  batch.Del("missing").Set("a", "1").Expire("missing", seconds(1));
+  ASSERT_TRUE(db->Write(batch).ok());
+  // A plain SET: frame (8) + type (1) + key (4 + 1) + value (4 + 1) + expiry
+  // (8).
+  EXPECT_EQ(file_.Size() - before, 27);
+}
+
+TEST_F(PersistTest, BatchOfNoOpsWritesNothing) {
+  auto db = Open();
+  const uint64_t before = file_.Size();
+  WriteBatch batch;
+  batch.Del("x").Expire("x", seconds(1)).Persist("x").Rename("x", "y");
+  ASSERT_TRUE(db->Write(batch).ok());
+  EXPECT_EQ(file_.Size(), before);
+}
+
+TEST_F(PersistTest, BatchIsAllOrNothingWhateverByteACrashStopsAt) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("old", "v").ok());
+    ASSERT_TRUE(db->Set("k", "1", seconds(100)).ok());
+    before = file_.Size();
+    WriteBatch batch;
+    batch.Set("new1", "a")
+        .Set("new2", "b", seconds(5))
+        .Del("old")
+        .Rename("k", "k2")
+        .Incr("n")
+        .Append("new1", "!");
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  const std::string full = file_.data();
+  ASSERT_GT(full.size(), before + 30);
+
+  const std::vector<std::string> before_keys = {"k", "old"};
+  const std::vector<std::string> after_keys = {"k2", "n", "new1", "new2"};
+  for (uint64_t cut = before; cut <= full.size(); ++cut) {
+    MemFile crashed(full.substr(0, cut));
+    StatusOr<std::unique_ptr<Db>> db =
+        Db::Open(std::make_unique<MemStorage>(&crashed), Options());
+    ASSERT_TRUE(db.ok()) << "cut=" << cut;
+    const bool complete = cut == full.size();
+    EXPECT_EQ(KeysOf(**db), complete ? after_keys : before_keys)
+        << "cut=" << cut;
+    if (complete) {
+      EXPECT_EQ((*db)->Get("new1"), "a!");
+      EXPECT_EQ((*db)->Get("n"), "1");
+    } else {
+      EXPECT_EQ((*db)->Get("old"), "v");
+      EXPECT_EQ((*db)->recovery_info().dropped_bytes, cut - before)
+          << "cut=" << cut;
+    }
+  }
+}
+
+TEST_F(PersistTest, BatchThatFailsToLogIsUndoneInMemory) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1", seconds(100)).ok());
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  ASSERT_EQ(db->Keys().size(), 2);  // builds the key index
+  const uint64_t size = file_.Size();
+
+  WriteBatch batch;
+  batch.Set("new", "x").Del("b").Rename("a", "c").Incr("n");
+
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->Write(batch).code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size);  // the partial record was removed
+  EXPECT_EQ(KeysOf(*db), (std::vector<std::string>{"a", "b"}));
+  EXPECT_EQ(db->GetTtl("a").remaining, seconds(100));
+  EXPECT_EQ(db->Get("b"), "2");
+
+  // Nothing was lost by trying: the same batch now goes through.
+  file_.FailAppendsBeyond(std::nullopt);
+  ASSERT_TRUE(db->Write(batch).ok());
+  EXPECT_EQ(KeysOf(*db), (std::vector<std::string>{"c", "n", "new"}));
+  EXPECT_EQ(db->GetTtl("c").remaining, seconds(100));
+}
+
+TEST_F(PersistTest, BatchThatFailsToSyncIsUndoneInMemory) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  file_.FailSyncs(true);
+  WriteBatch batch;
+  batch.Set("b", "2").Del("a");
+  EXPECT_EQ(db->Write(batch).code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("a"), "1");
+  EXPECT_FALSE(db->Exists("b"));
+  file_.FailSyncs(false);
+  EXPECT_EQ(db->Set("c", "3").code(), StatusCode::kIoError);  // Db has failed
+}
+
+TEST_F(PersistTest, FailedBatchLogsNothing) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("text", "abc").ok());
+  const uint64_t size = file_.Size();
+  WriteBatch batch;
+  batch.Set("a", "1").Incr("text");
+  EXPECT_EQ(db->Write(batch).code(), StatusCode::kNotInteger);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_FALSE(db->Exists("a"));
+}
+
+TEST_F(PersistTest, BatchAppendToAnExpiredKeyIsLoggedAsSet) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("k", "old", seconds(10)).ok());
+    Advance(seconds(10));  // expired, but still in memory
+    WriteBatch batch;
+    batch.Append("k", "new").Set("z", "1");
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(db->Get("k"), "new");  // not "oldnew"
+  EXPECT_EQ(db->GetTtl("k").state, Db::TtlState::kNoExpiry);
+}
+
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
   {
     auto db = Open();
@@ -735,7 +883,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(12)) {
+      switch (pick(13)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -795,6 +943,48 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 12: {
+          WriteBatch batch;
+          const int n = 1 + pick(4);
+          for (int j = 0; j < n; ++j) {
+            const std::string bk = key();
+            switch (pick(8)) {
+              case 0:
+                batch.Set(bk, std::to_string(pick(100)));
+                break;
+              case 1:
+                batch.Set(bk, std::to_string(pick(100)),
+                          milliseconds(pick(60) - 5));
+                break;
+              case 2:
+                batch.Del(bk);
+                break;
+              case 3:
+                batch.Expire(bk, milliseconds(pick(60) - 5));
+                break;
+              case 4:
+                batch.Persist(bk);
+                break;
+              case 5:
+                batch.Append(bk, std::to_string(pick(10)));
+                break;
+              case 6:
+                batch.Rename(bk, key());
+                break;
+              case 7:
+                if (pick(2) == 0) {
+                  batch.Incr(bk, pick(21) - 10);
+                } else {
+                  batch.Decr(bk, pick(21) - 10);
+                }
+                break;
+            }
+          }
+          // The same batch must succeed or fail the same way on both.
+          EXPECT_EQ(persistent->Write(batch).code(),
+                    reference.Write(batch).code());
+          break;
+        }
         case 11:
           if (pick(10) == 0) {
             EXPECT_EQ(persistent->Keys(), reference.Keys());

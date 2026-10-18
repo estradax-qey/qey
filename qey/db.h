@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -22,6 +23,7 @@
 #include "qey/log.h"
 #include "qey/status.h"
 #include "qey/storage.h"
+#include "qey/write_batch.h"
 
 namespace qey {
 
@@ -172,6 +174,20 @@ class Db {
   // kInvalidArgument if `to` exceeds kMaxKeySize.
   StatusOr<bool> Rename(std::string_view from, std::string_view to);
 
+  // Applies the changes in `batch` as one atomic unit; see WriteBatch. A
+  // persistent Db logs them in a single record, so recovery after a crash
+  // finds all of them or none. If this returns an error, the Db is unchanged.
+  // Fails with kInvalidArgument for an oversized key or value or a TTL beyond
+  // kMaxTtl, kNotInteger or kOutOfRange for a failed Incr() or Decr(), or
+  // kIoError if the log cannot be written. An empty batch succeeds.
+  Status Write(const WriteBatch& batch);
+
+  // Returns the values of `keys`, in order, with std::nullopt for keys that
+  // do not exist. The values are read at one instant: no write, including a
+  // WriteBatch, can land between two of them.
+  std::vector<std::optional<std::string>> MGet(
+      const std::vector<std::string>& keys);
+
   // Removes every key. A persistent Db replaces its log with an empty one, so
   // the file shrinks at once; if that fails, nothing is removed.
   Status Clear();
@@ -320,6 +336,20 @@ class Db {
   // Removes the entry at `it`, its expiry and its index entry. All entries are
   // removed through this. Requires `mu_` held.
   void EraseLocked(Map::iterator it);
+
+  // The state of the entries a batch has touched before it touched them, so
+  // that the batch can be undone. A nullopt value means the key did not exist.
+  using Undo = std::map<std::string, std::optional<Entry>, std::less<>>;
+
+  // Applies one change of a batch to memory, adds the record that describes
+  // it (or none, if it changes nothing) to `effective`, and notes what it
+  // overwrote in `undo`. Fails without side effects beyond `undo`. Requires
+  // `mu_` held.
+  Status StageLocked(const WriteBatch::Op& op, Undo* undo,
+                     std::vector<Record>* effective);
+
+  // Puts back everything recorded in `undo`. Requires `mu_` held.
+  void RollbackLocked(const Undo& undo);
 
   // Builds `keys_` from `map_` if it is not built yet. Requires `mu_` held.
   void EnsureKeyIndexLocked();
