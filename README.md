@@ -19,6 +19,9 @@ std::optional<std::string> v = (*db)->Get("greeting");
 (*db)->Incr("visits");
 ```
 
+The log compacts itself as it grows, and the file is locked while open, so a
+second `Open` of the same path fails with `kUnavailable`.
+
 By default every write is synced to disk before it returns. See
 [docs/design/persistence.md](docs/design/persistence.md) for the file format
 and crash behavior.

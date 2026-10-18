@@ -1,6 +1,6 @@
 # Persistence design
 
-Status: proposed
+Status: implemented
 
 ## Goals
 
@@ -104,11 +104,18 @@ byte count so callers can notice an unexpectedly large loss.
 
 ## Compaction
 
-Triggered automatically after a write when the file size exceeds both a
-minimum (4 MiB) and 2x the size of the file right after the last compaction.
-It can also be called explicitly with `Db::Compact()`.
+Runs automatically before a write once the log is larger than
+`compact_min_bytes` (default 4 MiB) and `compact_ratio` (default 2) times its
+size right after the last compaction. At open, the baseline is the encoded
+size of the live data, so a bloated log is compacted immediately. It can also
+be called explicitly with `Db::Compact()`, which additionally drops expired
+keys from memory. `OpenOptions::auto_compact = false` turns the automatic
+trigger off.
 
-1. Write header + one `SET` per live key to `<path>.tmp`.
+Compaction is done by `Storage::Replace()`; `PosixStorage` implements it as:
+
+1. Write header + one `SET` per live key to `<path>.tmp` (records are batched
+   into ~1 MiB appends), skipping keys that have expired.
 2. `fsync` the temp file, then `rename` it over `<path>`.
 3. `fsync` the containing directory.
 
@@ -116,14 +123,34 @@ A crash before step 2 leaves the old file untouched and a stray `.tmp`, which
 `Open` deletes. After step 2 the new file is complete. The store is
 **logically one file**; `.tmp` exists only during compaction.
 
+If compaction fails before the rename, the old log stays in use and the
+database keeps working. A failed *automatic* compaction does not fail the
+write that triggered it, and is not retried until the log has grown by
+another `compact_min_bytes`. If the directory sync after the rename fails,
+whether the rename is durable is unknown, and writes acknowledged to the new
+file might be lost if the old one reappears after a power loss. The log then
+fails every operation, so the database stops accepting writes until it is
+reopened.
+
 Compaction runs synchronously under the store's lock, blocking other callers
-while it runs. Simple first; background compaction is a possible later step.
+while it runs. It is triggered at the start of a write, before any lookup, so
+memory and log agree and no iterator is outstanding. Background compaction is
+a possible later step.
 
 ## Locking
 
-`Open` takes an exclusive advisory `flock` on the file and fails with
-`kUnavailable` if another process holds it. During compaction the new file is
-locked before the rename, so the lock is held continuously.
+`PosixStorage::Open` takes an exclusive, non-blocking `flock` on the file and
+fails with `kUnavailable` if another handle holds it. This also catches a
+second `Open` of the same path within one process. During compaction the new
+file is locked before the rename, so the lock is held continuously. Only the
+lock holder removes a stale `.tmp`.
+
+## Storage abstraction
+
+`Db` talks to a `Storage`, which exposes the current log as a `File` and a
+`Replace(fill)` operation that atomically swaps in a rewritten log. This keeps
+the file-system specifics (temp file, rename, directory sync, lock) out of
+`Db` and lets tests inject failures at each step with `MemStorage`.
 
 ## API changes
 
@@ -134,9 +161,14 @@ the in-memory API (`feat!`):
 struct OpenOptions {
   SyncPolicy sync = SyncPolicy::kAlways;
   Recovery recovery = Recovery::kTruncate;
+  bool auto_compact = true;
+  uint64_t compact_min_bytes = 4 << 20;
+  uint32_t compact_ratio = 2;
 };
 
 static StatusOr<std::unique_ptr<Db>> Open(std::string_view path,
+                                           OpenOptions options = {});
+static StatusOr<std::unique_ptr<Db>> Open(std::unique_ptr<Storage> storage,
                                            OpenOptions options = {});
 Db();  // unchanged: in-memory only, never fails
 
@@ -170,7 +202,8 @@ signatures. New status codes: `kIoError`, `kCorruption`, `kUnavailable`,
 3. `feat(db)`: `Db::Open`, append-on-write, sync policy, recovery.
 4. `feat(db)`: compaction, locking, `Sync()`/`Compact()`.
 
-## Open questions
+## Possible later work
 
-- Is POSIX-only acceptable for now? (Assumed yes.)
-- Is the 4 MiB / 2x compaction rule a reasonable default?
+- Background compaction, so writers are not blocked.
+- A periodic-sync policy (`kEverySecond`) with an optional sync thread.
+- Windows support (a `Storage` implementation).
