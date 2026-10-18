@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "qey/file.h"
 #include "qey/log.h"
@@ -61,6 +62,13 @@ struct OpenOptions {
   std::function<std::chrono::system_clock::time_point()> wall_now;
 };
 
+// One page of keys from Db::Scan().
+struct ScanPage {
+  std::vector<std::string> keys;
+  // Pass to the next Scan() call to continue. Empty when there is nothing more.
+  std::optional<std::string> next;
+};
+
 // What Db::Open() found in the log.
 struct RecoveryInfo {
   size_t records_replayed = 0;
@@ -102,6 +110,11 @@ class Db {
   static constexpr std::chrono::milliseconds kMaxTtl{
       std::chrono::hours(24 * 365 * 100)};
 
+  // Limits on key and value sizes, so that every change fits in one log
+  // record and can be compacted.
+  static constexpr size_t kMaxKeySize = 1u << 20;
+  static constexpr size_t kMaxValueSize = 64u << 20;
+
   using Clock = std::chrono::steady_clock;
   using NowFn = std::function<Clock::time_point()>;
   using WallNowFn = std::function<std::chrono::system_clock::time_point()>;
@@ -135,7 +148,8 @@ class Db {
   // Sets `key` to `value`, replacing any existing value and TTL. If `ttl` is
   // set, the key expires after that duration; otherwise it never expires. A
   // non-positive `ttl` makes the key expire immediately. Fails with
-  // kInvalidArgument, changing nothing, if `ttl` exceeds kMaxTtl.
+  // kInvalidArgument, changing nothing, if `ttl` exceeds kMaxTtl or the key or
+  // value exceeds kMaxKeySize or kMaxValueSize.
   Status Set(std::string_view key, std::string_view value,
              std::optional<std::chrono::milliseconds> ttl = std::nullopt);
 
@@ -144,6 +158,39 @@ class Db {
 
   // Removes `key`. Returns true if a live key was removed.
   StatusOr<bool> Del(std::string_view key);
+
+  // Appends `suffix` to the value of `key` and returns the new length. A
+  // missing key is created with `suffix` as its value and no TTL; an existing
+  // key keeps its TTL. Fails with kInvalidArgument, changing nothing, if the
+  // key exceeds kMaxKeySize or the result would exceed kMaxValueSize.
+  StatusOr<size_t> Append(std::string_view key, std::string_view suffix);
+
+  // Moves the value and TTL of `from` to `to`, replacing whatever `to` held.
+  // Returns false, changing nothing, if `from` does not exist. Renaming a key
+  // to itself returns true. A persistent Db logs the rename as one record, so
+  // a crash leaves either the old name or the new one. Fails with
+  // kInvalidArgument if `to` exceeds kMaxKeySize.
+  StatusOr<bool> Rename(std::string_view from, std::string_view to);
+
+  // Removes every key. A persistent Db replaces its log with an empty one, so
+  // the file shrinks at once; if that fails, nothing is removed.
+  Status Clear();
+
+  // Returns the live keys that start with `prefix`, in byte order. An empty
+  // prefix matches every key. Holds the lock while it runs, so on a large
+  // store prefer Scan().
+  std::vector<std::string> Keys(std::string_view prefix = "");
+
+  // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
+  // byte order, starting after `after` (or from the beginning if empty).
+  // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
+  // in order, so a key that exists for the whole scan is returned exactly
+  // once even if other keys are added or removed between calls. Each call
+  // costs O(log n + limit). The first scan of a Db builds an ordered index of
+  // its keys, O(n log n), and every later key creation and removal also
+  // updates it.
+  ScanPage Scan(std::string_view prefix, size_t limit,
+                const std::optional<std::string>& after = std::nullopt);
 
   // Adds `delta` to the integer stored at `key` and returns the new value. A
   // missing key is treated as 0. The key's TTL is preserved. Fails with
@@ -202,7 +249,14 @@ class Db {
     std::optional<Clock::time_point> expires_at;
   };
 
-  using Map = std::unordered_map<std::string, Entry>;
+  // Transparent hashing lets lookups take a string_view without allocating.
+  struct KeyHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view key) const noexcept {
+      return std::hash<std::string_view>()(key);
+    }
+  };
+  using Map = std::unordered_map<std::string, Entry, KeyHash, std::equal_to<>>;
 
   Db(NowFn now, WallNowFn wall_now);
 
@@ -213,8 +267,9 @@ class Db {
   // before looking anything up, while memory and log agree. Requires `mu_`.
   void MaybeCompactLocked();
 
-  // Rewrites the log from memory, omitting expired keys. Requires `mu_` held.
-  Status CompactLocked();
+  // Rewrites the log from memory, omitting expired keys, or with no keys at
+  // all if `empty`. Requires `mu_` held.
+  Status CompactLocked(bool empty = false);
 
   // Sets the size at which the next automatic compaction happens, given the
   // log size right after a compaction (or the live data size).
@@ -257,8 +312,21 @@ class Db {
   void SetExpiryLocked(Map::iterator it, Clock::time_point at);
   void ClearExpiryLocked(Map::iterator it);
 
-  // Removes the entry at `it` and its expiry. Requires `mu_` held.
+  // Returns the entry for `key`, creating an empty one if there is none. All
+  // entries are created through this, so `keys_` stays in sync. Requires
+  // `mu_` held.
+  Map::iterator InsertLocked(std::string_view key);
+
+  // Removes the entry at `it`, its expiry and its index entry. All entries are
+  // removed through this. Requires `mu_` held.
   void EraseLocked(Map::iterator it);
+
+  // Builds `keys_` from `map_` if it is not built yet. Requires `mu_` held.
+  void EnsureKeyIndexLocked();
+
+  // Moves the entry at `it` to the key `to`, replacing any entry there, and
+  // keeps its expiry. `to` must differ from the entry's key. Requires `mu_`.
+  void RenameLocked(Map::iterator it, std::string_view to);
 
   // Implements Incr() and Decr(). Requires `mu_` held.
   StatusOr<int64_t> AddLocked(std::string_view key, int64_t delta,
@@ -283,6 +351,13 @@ class Db {
   // Mirrors the expiry of every entry in `map_` that has one, ordered by
   // expiry time, so Sweep() only visits keys that are due.
   std::set<std::pair<Clock::time_point, std::string>> expiry_;
+  // Every key in `map_`, in byte order, so prefix scans do not have to look at
+  // every key. The views point at the keys inside `map_`'s nodes, which stay
+  // put until the entry is erased. Built the first time Keys() or Scan() is
+  // called (`keys_built_`) and kept up to date after that, so a Db that is
+  // never scanned never pays for it. Lookups stay O(1) either way.
+  std::set<std::string_view> keys_;
+  bool keys_built_ = false;
 };
 
 }  // namespace qey

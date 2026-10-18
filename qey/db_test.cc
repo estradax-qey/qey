@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "gtest/gtest.h"
 
@@ -308,6 +310,254 @@ TEST_F(DbTest, VeryNegativeTtlExpiresImmediately) {
   Set("b", "v");
   EXPECT_TRUE(Expire("b", milliseconds::min()));
   EXPECT_FALSE(db_.Exists("b"));
+}
+
+using Keys = std::vector<std::string>;
+
+TEST_F(DbTest, AppendCreatesAndExtends) {
+  EXPECT_EQ(*db_.Append("k", "ab"), 2);
+  EXPECT_EQ(*db_.Append("k", "cd"), 4);
+  EXPECT_EQ(db_.Get("k"), "abcd");
+
+  EXPECT_EQ(*db_.Append("empty", ""), 0);  // still creates the key
+  EXPECT_EQ(db_.Get("empty"), "");
+
+  EXPECT_EQ(*db_.Append("bin", std::string_view("\0x", 2)), 2);
+  EXPECT_EQ(*db_.Append("bin", std::string_view("\0", 1)), 3);
+  EXPECT_EQ(db_.Get("bin"), std::string("\0x\0", 3));
+}
+
+TEST_F(DbTest, AppendKeepsTtl) {
+  Set("k", "ab", milliseconds(100));
+  Advance(milliseconds(40));
+  EXPECT_EQ(*db_.Append("k", "cd"), 4);
+  EXPECT_EQ(db_.GetTtl("k").remaining, milliseconds(60));
+  Advance(milliseconds(60));
+  EXPECT_FALSE(db_.Exists("k"));
+}
+
+TEST_F(DbTest, AppendToExpiredKeyStartsFresh) {
+  Set("k", "old", milliseconds(10));
+  Advance(milliseconds(10));
+  EXPECT_EQ(*db_.Append("k", "new"), 3);
+  EXPECT_EQ(db_.Get("k"), "new");
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, OversizedKeysAreRejectedEverywhere) {
+  const std::string big_key(Db::kMaxKeySize + 1, 'k');
+  const std::string ok_key(Db::kMaxKeySize, 'k');
+  EXPECT_EQ(db_.Set(big_key, "v").code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Append(big_key, "v").status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Incr(big_key).status().code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Decr(big_key).status().code(), StatusCode::kInvalidArgument);
+  Set("a", "v");
+  EXPECT_EQ(db_.Rename("a", big_key).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Get("a"), "v");
+  EXPECT_EQ(db_.Size(), 1);
+
+  Set(ok_key, "v");  // exactly at the limit is fine
+  EXPECT_EQ(db_.Get(ok_key), "v");
+}
+
+TEST_F(DbTest, ValueSizeLimit) {
+  std::string big(Db::kMaxValueSize + 1, 'x');
+  const std::string_view at_limit(big.data(), Db::kMaxValueSize);
+  EXPECT_EQ(db_.Set("k", big).code(), StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("k"));
+
+  ASSERT_TRUE(db_.Set("k", at_limit).ok());
+  EXPECT_EQ(db_.Append("k", "y").status().code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Append("fresh", big).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("fresh"));
+  EXPECT_EQ(*db_.Append("k", ""), Db::kMaxValueSize);  // adding nothing is fine
+}
+
+TEST_F(DbTest, RenameMovesValueAndTtl) {
+  Set("a", "va", milliseconds(100));
+  EXPECT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_FALSE(db_.Exists("a"));
+  EXPECT_EQ(db_.Get("b"), "va");
+  EXPECT_EQ(db_.GetTtl("b").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Size(), 1);
+
+  // The expiry index followed the key: sweeping removes it under its new name.
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Size(), 0);
+}
+
+TEST_F(DbTest, RenameReplacesDestinationAndItsTtl) {
+  Set("a", "va");
+  Set("b", "vb", milliseconds(50));
+  EXPECT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_EQ(db_.Get("b"), "va");
+  EXPECT_EQ(db_.GetTtl("b").state, Db::TtlState::kNoExpiry);
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Sweep(), 0);  // the old TTL on "b" is gone
+  EXPECT_EQ(db_.Get("b"), "va");
+}
+
+TEST_F(DbTest, RenameReplacesAnExpiredDestination) {
+  Set("b", "vb", milliseconds(10));
+  Set("a", "va");
+  Advance(milliseconds(10));
+  EXPECT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_EQ(db_.Get("b"), "va");
+  EXPECT_EQ(db_.Size(), 1);
+}
+
+TEST_F(DbTest, RenameOfMissingOrExpiredSourceReturnsFalse) {
+  EXPECT_FALSE(*db_.Rename("nope", "b"));
+  Set("a", "v", milliseconds(10));
+  Set("b", "keep");
+  Advance(milliseconds(10));
+  EXPECT_FALSE(*db_.Rename("a", "b"));
+  EXPECT_EQ(db_.Get("b"), "keep");
+}
+
+TEST_F(DbTest, RenameToSameNameIsANoOp) {
+  Set("a", "v", milliseconds(100));
+  EXPECT_TRUE(*db_.Rename("a", "a"));
+  EXPECT_EQ(db_.Get("a"), "v");
+  EXPECT_EQ(db_.GetTtl("a").remaining, milliseconds(100));
+  EXPECT_FALSE(*db_.Rename("nope", "nope"));
+}
+
+TEST_F(DbTest, ClearRemovesEverything) {
+  Set("a", "1");
+  Set("b", "2", milliseconds(10));
+  ASSERT_TRUE(db_.Clear().ok());
+  EXPECT_EQ(db_.Size(), 0);
+  EXPECT_FALSE(db_.Exists("a"));
+  EXPECT_EQ(db_.Keys(), Keys{});
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 0);  // the expiry index was cleared too
+
+  Set("a", "again");  // the Db is fully usable afterwards
+  EXPECT_EQ(db_.Get("a"), "again");
+  EXPECT_EQ(db_.Keys(), Keys{"a"});
+  EXPECT_TRUE(db_.Clear().ok());  // clearing an empty Db is fine
+}
+
+TEST_F(DbTest, KeysAreSortedAndFilteredByPrefix) {
+  for (const char* k : {"b2", "a1", "b1", "c", "a", "", "b"}) Set(k, "v");
+  EXPECT_EQ(db_.Keys(), (Keys{"", "a", "a1", "b", "b1", "b2", "c"}));
+  EXPECT_EQ(db_.Keys(""), db_.Keys());
+  EXPECT_EQ(db_.Keys("b"), (Keys{"b", "b1", "b2"}));
+  EXPECT_EQ(db_.Keys("b1"), (Keys{"b1"}));
+  EXPECT_EQ(db_.Keys("a1x"), Keys{});
+  EXPECT_EQ(db_.Keys("zzz"), Keys{});
+
+  Set(std::string_view("\0a", 2), "v");
+  Set(std::string_view("\xff\xff", 2), "v");
+  EXPECT_EQ(db_.Keys(std::string_view("\0", 1)), Keys{std::string("\0a", 2)});
+  EXPECT_EQ(db_.Keys(std::string_view("\xff", 1)),
+            Keys{std::string("\xff\xff", 2)});
+}
+
+TEST_F(DbTest, KeysSkipExpiredKeysThatAreNotSweptYet) {
+  Set("a", "1", milliseconds(10));
+  Set("b", "2");
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Keys(), Keys{"b"});
+  EXPECT_EQ(db_.Size(), 2);
+}
+
+TEST_F(DbTest, ScanPagesThroughAllMatchingKeys) {
+  for (int i = 0; i < 10; ++i) Set("k0" + std::to_string(i), "v");
+  Set("other", "v");
+
+  Keys seen;
+  std::vector<size_t> page_sizes;
+  std::optional<std::string> cursor;
+  do {
+    ScanPage page = db_.Scan("k", 3, cursor);
+    page_sizes.push_back(page.keys.size());
+    seen.insert(seen.end(), page.keys.begin(), page.keys.end());
+    cursor = page.next;
+  } while (cursor.has_value());
+  EXPECT_EQ(seen, db_.Keys("k"));
+  EXPECT_EQ(page_sizes, (std::vector<size_t>{3, 3, 3, 1}));
+}
+
+TEST_F(DbTest, ScanEndsExactlyWhenNothingIsLeft) {
+  for (int i = 0; i < 10; ++i) Set("k0" + std::to_string(i), "v");
+  ScanPage first = db_.Scan("k", 5);
+  ASSERT_EQ(first.keys.size(), 5);
+  ASSERT_TRUE(first.next.has_value());
+  ScanPage second = db_.Scan("k", 5, first.next);
+  EXPECT_EQ(second.keys.size(), 5);
+  EXPECT_FALSE(second.next.has_value());  // no empty trailing page
+
+  EXPECT_FALSE(db_.Scan("k", 100).next.has_value());
+  ScanPage none = db_.Scan("nope", 5);
+  EXPECT_TRUE(none.keys.empty());
+  EXPECT_FALSE(none.next.has_value());
+}
+
+TEST_F(DbTest, ScanIncludesTheEmptyKeyAndTreatsZeroLimitAsOne) {
+  Set("", "v");
+  Set("a", "v");
+  ScanPage page = db_.Scan("", 0);
+  EXPECT_EQ(page.keys, Keys{""});
+  ASSERT_TRUE(page.next.has_value());
+  EXPECT_EQ(db_.Scan("", 0, page.next).keys, Keys{"a"});
+}
+
+TEST_F(DbTest, ScanWithCursorBeforeThePrefixStartsAtThePrefix) {
+  for (const char* k : {"a", "m1", "m2", "z"}) Set(k, "v");
+  EXPECT_EQ(db_.Scan("m", 10, std::string("a")).keys, (Keys{"m1", "m2"}));
+  EXPECT_EQ(db_.Scan("m", 10, std::string("z")).keys, Keys{});
+}
+
+TEST_F(DbTest, ScanReturnsEachStableKeyOnceDespiteChanges) {
+  for (int i = 0; i < 10; ++i) Set("k0" + std::to_string(i), "v");
+  ScanPage page = db_.Scan("k", 4);
+  ASSERT_EQ(page.keys, (Keys{"k00", "k01", "k02", "k03"}));
+
+  EXPECT_TRUE(*db_.Del("k01"));  // behind the cursor
+  EXPECT_TRUE(*db_.Del("k05"));  // ahead of it
+  Set("k035", "v");              // lands just ahead of the cursor
+  Set("k99", "v");
+  Set("a-before", "v");  // outside the prefix
+
+  Keys rest;
+  for (auto cursor = page.next; cursor.has_value();) {
+    ScanPage next = db_.Scan("k", 4, cursor);
+    rest.insert(rest.end(), next.keys.begin(), next.keys.end());
+    cursor = next.next;
+  }
+  EXPECT_EQ(rest, (Keys{"k035", "k04", "k06", "k07", "k08", "k09", "k99"}));
+}
+
+TEST_F(DbTest, KeyIndexStaysCurrentAfterItIsBuilt) {
+  Set("a", "1");
+  Set("b", "2");
+  ASSERT_EQ(db_.Keys(), (Keys{"a", "b"}));  // builds the index
+
+  Set("c", "3");
+  EXPECT_EQ(db_.Keys(), (Keys{"a", "b", "c"}));
+  EXPECT_TRUE(*db_.Del("a"));
+  EXPECT_EQ(db_.Keys(), (Keys{"b", "c"}));
+  EXPECT_TRUE(*db_.Rename("b", "z"));
+  EXPECT_EQ(db_.Keys(), (Keys{"c", "z"}));
+  EXPECT_EQ(*db_.Append("new", "x"), 1);
+  EXPECT_EQ(*db_.Incr("n"), 1);
+  EXPECT_EQ(db_.Keys(), (Keys{"c", "n", "new", "z"}));
+
+  Set("t", "v", milliseconds(10));
+  Advance(milliseconds(10));
+  EXPECT_EQ(db_.Sweep(), 1);  // erasing an expired key updates the index
+  EXPECT_EQ(db_.Keys(), (Keys{"c", "n", "new", "z"}));
+
+  ASSERT_TRUE(db_.Clear().ok());
+  EXPECT_EQ(db_.Keys(), Keys{});
+  Set("again", "v");
+  EXPECT_EQ(db_.Keys(), Keys{"again"});
 }
 
 TEST_F(DbTest, DefaultClockConstructs) {

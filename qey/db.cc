@@ -29,6 +29,14 @@ Status CheckTtl(std::chrono::milliseconds ttl) {
   return Status::Ok();
 }
 
+Status CheckKey(std::string_view key) {
+  if (key.size() > Db::kMaxKeySize) {
+    return Status(StatusCode::kInvalidArgument,
+                  "key is longer than kMaxKeySize");
+  }
+  return Status::Ok();
+}
+
 // A TTL that is not positive expires the key immediately. Clamping it to zero
 // also keeps very negative values from overflowing time arithmetic.
 std::chrono::milliseconds ClampTtl(std::chrono::milliseconds ttl) {
@@ -142,6 +150,12 @@ Status Db::Set(std::string_view key, std::string_view value,
     Status valid = CheckTtl(*ttl);
     if (!valid.ok()) return valid;
   }
+  Status valid_key = CheckKey(key);
+  if (!valid_key.ok()) return valid_key;
+  if (value.size() > kMaxValueSize) {
+    return Status(StatusCode::kInvalidArgument,
+                  "value is longer than kMaxValueSize");
+  }
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
   std::optional<Clock::time_point> expires_at;
@@ -153,7 +167,7 @@ Status Db::Set(std::string_view key, std::string_view value,
   Status s = LogLocked(record);
   if (!s.ok()) return s;
 
-  auto it = map_.try_emplace(std::string(key)).first;
+  auto it = InsertLocked(key);
   ClearExpiryLocked(it);
   it->second.value = std::string(value);
   if (expires_at.has_value()) SetExpiryLocked(it, *expires_at);
@@ -179,12 +193,16 @@ StatusOr<bool> Db::Del(std::string_view key) {
 }
 
 StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
+  Status valid = CheckKey(key);
+  if (!valid.ok()) return valid;
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
   return AddLocked(key, delta, /*subtract=*/false);
 }
 
 StatusOr<int64_t> Db::Decr(std::string_view key, int64_t delta) {
+  Status valid = CheckKey(key);
+  if (!valid.ok()) return valid;
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
   return AddLocked(key, delta, /*subtract=*/true);
@@ -238,6 +256,95 @@ StatusOr<bool> Db::Persist(std::string_view key) {
   if (!s.ok()) return s;
   ClearExpiryLocked(it);
   return true;
+}
+
+StatusOr<size_t> Db::Append(std::string_view key, std::string_view suffix) {
+  Status valid = CheckKey(key);
+  if (!valid.ok()) return valid;
+  std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
+  auto it = FindLive(key);
+  const size_t old_size = it == map_.end() ? 0 : it->second.value.size();
+  if (suffix.size() > kMaxValueSize ||
+      old_size > kMaxValueSize - suffix.size()) {
+    return Status(StatusCode::kInvalidArgument,
+                  "value would be longer than kMaxValueSize");
+  }
+
+  if (it == map_.end()) {
+    // A new key is logged as a plain SET: replay must not depend on whether
+    // an earlier, expired value is still around.
+    Status s = LogLocked(Record{Record::Type::kSet, std::string(key),
+                                std::string(suffix), std::nullopt});
+    if (!s.ok()) return s;
+    InsertLocked(key)->second.value = suffix;
+  } else {
+    Status s = LogLocked(Record{Record::Type::kAppend, std::string(key),
+                                std::string(suffix), std::nullopt});
+    if (!s.ok()) return s;
+    it->second.value.append(suffix);
+  }
+  return old_size + suffix.size();
+}
+
+StatusOr<bool> Db::Rename(std::string_view from, std::string_view to) {
+  Status valid = CheckKey(to);
+  if (!valid.ok()) return valid;
+  std::lock_guard<std::mutex> lock(mu_);
+  MaybeCompactLocked();
+  auto it = FindLive(from);
+  if (it == map_.end()) return false;
+  if (from == to) return true;
+
+  Status s = LogLocked(
+      Record{Record::Type::kRename, std::string(from), std::string(to), {}});
+  if (!s.ok()) return s;
+  RenameLocked(it, to);
+  return true;
+}
+
+Status Db::Clear() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (storage_ != nullptr) {
+    Status healthy = CheckHealthyLocked();
+    if (!healthy.ok()) return healthy;
+    Status s = CompactLocked(/*empty=*/true);
+    if (!s.ok()) return s;
+  }
+  keys_.clear();  // stays built: an empty index of an empty map
+  map_.clear();
+  expiry_.clear();
+  return Status::Ok();
+}
+
+std::vector<std::string> Db::Keys(std::string_view prefix) {
+  return Scan(prefix, std::numeric_limits<size_t>::max()).keys;
+}
+
+ScanPage Db::Scan(std::string_view prefix, size_t limit,
+                  const std::optional<std::string>& after) {
+  std::lock_guard<std::mutex> lock(mu_);
+  EnsureKeyIndexLocked();
+  limit = std::max<size_t>(limit, 1);
+  const Clock::time_point now = now_();
+
+  auto it = (after.has_value() && std::string_view(*after) >= prefix)
+                ? keys_.upper_bound(std::string_view(*after))
+                : keys_.lower_bound(prefix);
+  ScanPage page;
+  // Keys are ordered, so everything with the prefix is contiguous.
+  for (; it != keys_.end() && it->starts_with(prefix); ++it) {
+    auto entry = map_.find(*it);
+    assert(entry != map_.end());
+    const auto& expires_at = entry->second.expires_at;
+    if (expires_at.has_value() && now >= *expires_at) continue;
+    if (page.keys.size() == limit) {
+      page.next = page.keys.back();  // there is at least one more
+      break;
+    }
+    page.keys.emplace_back(*it);
+  }
+  return page;
 }
 
 Status Db::Sync() {
@@ -339,8 +446,7 @@ StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
   if (it != map_.end()) {
     it->second.value = std::move(text);
   } else {
-    map_.insert_or_assign(std::string(key),
-                          Entry{std::move(text), std::nullopt});
+    InsertLocked(key)->second.value = std::move(text);
   }
   return result;
 }
@@ -398,13 +504,14 @@ void Db::MaybeCompactLocked() {
   }
 }
 
-Status Db::CompactLocked() {
+Status Db::CompactLocked(bool empty) {
   const Clock::time_point now = now_();
   Status s = storage_->Replace([&](File& out) -> Status {
     // Batch records so that a big database is not written one call per key.
     constexpr size_t kFlushBytes = 1 << 20;
     std::string buf = EncodeHeader();
     for (const auto& [key, entry] : map_) {
+      if (empty) break;
       if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
       Record record{Record::Type::kSet, key, entry.value, std::nullopt};
       if (entry.expires_at.has_value()) {
@@ -436,7 +543,7 @@ void Db::SetCompactThreshold(uint64_t base_size) {
 void Db::ApplyRecordLocked(Record&& record) {
   switch (record.type) {
     case Record::Type::kSet: {
-      auto it = map_.try_emplace(std::move(record.key)).first;
+      auto it = InsertLocked(record.key);
       ClearExpiryLocked(it);
       it->second.value = std::move(record.value);
       if (record.expires_at_ms.has_value()) {
@@ -459,6 +566,20 @@ void Db::ApplyRecordLocked(Record&& record) {
     case Record::Type::kPersist: {
       auto it = map_.find(record.key);
       if (it != map_.end()) ClearExpiryLocked(it);
+      break;
+    }
+    case Record::Type::kAppend: {
+      // The key was live when this was logged, so it exists unless the log
+      // was edited; tolerate that by creating it.
+      auto it = InsertLocked(record.key);
+      it->second.value.append(record.value);
+      break;
+    }
+    case Record::Type::kRename: {
+      auto it = map_.find(record.key);
+      if (it != map_.end() && record.key != record.value) {
+        RenameLocked(it, record.value);
+      }
       break;
     }
   }
@@ -505,13 +626,49 @@ void Db::ClearExpiryLocked(Map::iterator it) {
   it->second.expires_at.reset();
 }
 
+void Db::RenameLocked(Map::iterator it, std::string_view to) {
+  // Whatever is at `to`, live or expired, is replaced.
+  auto dest = map_.find(to);
+  if (dest != map_.end()) EraseLocked(dest);
+
+  const std::optional<Clock::time_point> expires_at = it->second.expires_at;
+  ClearExpiryLocked(it);
+  if (keys_built_)
+    keys_.erase(std::string_view(it->first));  // before it changes
+  auto node = map_.extract(it);
+  node.key() = std::string(to);
+  auto inserted = map_.insert(std::move(node));
+  if (keys_built_) keys_.insert(std::string_view(inserted.position->first));
+  if (expires_at.has_value()) SetExpiryLocked(inserted.position, *expires_at);
+}
+
+Db::Map::iterator Db::InsertLocked(std::string_view key) {
+  auto it = map_.find(key);
+  if (it != map_.end()) return it;
+  it = map_.try_emplace(std::string(key)).first;
+  if (keys_built_) keys_.insert(std::string_view(it->first));
+  return it;
+}
+
+void Db::EnsureKeyIndexLocked() {
+  if (keys_built_) return;
+  // Sorting first lets the set be filled with cheap end-of-set hints.
+  std::vector<std::string_view> sorted;
+  sorted.reserve(map_.size());
+  for (const auto& entry : map_) sorted.emplace_back(entry.first);
+  std::sort(sorted.begin(), sorted.end());
+  for (std::string_view key : sorted) keys_.emplace_hint(keys_.end(), key);
+  keys_built_ = true;
+}
+
 void Db::EraseLocked(Map::iterator it) {
   ClearExpiryLocked(it);
+  if (keys_built_) keys_.erase(std::string_view(it->first));  // before it dies
   map_.erase(it);
 }
 
 Db::Map::iterator Db::FindLive(std::string_view key) {
-  auto it = map_.find(std::string(key));
+  auto it = map_.find(key);
   if (it == map_.end()) return it;
   const auto& expires_at = it->second.expires_at;
   if (expires_at.has_value() && now_() >= *expires_at) {

@@ -9,6 +9,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "qey/db.h"
@@ -132,6 +133,151 @@ TEST_F(PersistTest, KeysExpiredWhileClosedAreDroppedOnOpen) {
   EXPECT_FALSE(db->Exists("short"));
   EXPECT_TRUE(db->Exists("long"));
   EXPECT_TRUE(db->Exists("forever"));
+}
+
+TEST_F(PersistTest, AppendRenameAndClearSurviveReopen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    ASSERT_EQ(*db->Append("a", "23"), 3);
+    ASSERT_EQ(*db->Append("fresh", "x"), 1);
+    ASSERT_TRUE(db->Set("b", "vb", seconds(100)).ok());
+    ASSERT_TRUE(*db->Rename("b", "c"));
+    ASSERT_TRUE(db->Set("gone", "x").ok());
+    ASSERT_TRUE(db->Clear().ok());
+    ASSERT_TRUE(db->Set("e", "after clear").ok());
+    ASSERT_EQ(*db->Append("e", "!"), 12);
+  }
+  auto db = Open();
+  EXPECT_EQ(db->Keys(), std::vector<std::string>{"e"});
+  EXPECT_EQ(db->Get("e"), "after clear!");
+}
+
+TEST_F(PersistTest, AppendedAndRenamedValuesAndTtlsSurviveRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    ASSERT_EQ(*db->Append("a", "23"), 3);
+    ASSERT_TRUE(db->Set("b", "vb", seconds(100)).ok());
+    ASSERT_EQ(*db->Append("b", "!"), 3);
+    ASSERT_TRUE(*db->Rename("b", "c"));
+    ASSERT_TRUE(db->Set("d", "old", seconds(5)).ok());
+    ASSERT_TRUE(*db->Rename("a", "d"));  // replaces d and its TTL
+  }
+  Restart(seconds(10));
+  auto db = Open();
+  EXPECT_EQ(db->Keys(), (std::vector<std::string>{"c", "d"}));
+  EXPECT_EQ(db->Get("c"), "vb!");
+  EXPECT_EQ(db->GetTtl("c").remaining, seconds(90));
+  EXPECT_EQ(db->Get("d"), "123");
+  EXPECT_EQ(db->GetTtl("d").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(PersistTest, AppendLogsOnlyTheSuffix) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("k", std::string(10000, 'x')).ok());
+  const uint64_t before = file_.Size();
+  ASSERT_EQ(*db->Append("k", "y"), 10001);
+  // frame (8) + type (1) + key (4 + 1) + suffix (4 + 1)
+  EXPECT_EQ(file_.Size() - before, 19);
+}
+
+TEST_F(PersistTest, AppendToAnExpiredKeyDoesNotResurrectItAfterRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("k", "old", seconds(10)).ok());
+    Advance(seconds(10));  // expired, but still in memory
+    ASSERT_EQ(*db->Append("k", "new"), 3);
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(db->Get("k"), "new");  // not "oldnew"
+  EXPECT_EQ(db->GetTtl("k").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(PersistTest, RenameIsOneRecordSoATornWriteLeavesItUndone) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "va").ok());
+    ASSERT_TRUE(db->Set("b", "vb", seconds(100)).ok());
+  }
+  const std::string before = file_.data();
+  {
+    auto db = Open();
+    ASSERT_TRUE(*db->Rename("a", "b"));
+  }
+  // frame (8) + type (1) + from (4 + 1) + to (4 + 1)
+  ASSERT_EQ(file_.Size() - before.size(), 19);
+
+  // A complete record: renamed, and "b" lost its TTL.
+  {
+    MemFile copy(file_.data());
+    auto db = Db::Open(std::make_unique<MemStorage>(&copy), Options());
+    ASSERT_TRUE(db.ok());
+    EXPECT_FALSE((*db)->Exists("a"));
+    EXPECT_EQ((*db)->Get("b"), "va");
+  }
+  // One byte short of complete: as if the process died mid-write.
+  file_.data().pop_back();
+  auto db = Open();
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 18);
+  EXPECT_EQ(db->Get("a"), "va");
+  EXPECT_EQ(db->Get("b"), "vb");
+  EXPECT_EQ(db->GetTtl("b").state, Db::TtlState::kExpiring);
+}
+
+TEST_F(PersistTest, ClearEmptiesTheLogAtOnce) {
+  auto db = Open();
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db->Set("k" + std::to_string(i), "value").ok());
+  }
+  ASSERT_GT(file_.Size(), 1000);
+  ASSERT_TRUE(db->Clear().ok());
+  EXPECT_EQ(file_.Size(), kLogHeaderSize);
+  EXPECT_EQ(storage_->replace_count(), 1);
+  EXPECT_EQ(db->Size(), 0);
+
+  ASSERT_TRUE(db->Set("after", "1").ok());
+  db.reset();
+  db = Open();
+  EXPECT_EQ(db->Keys(), std::vector<std::string>{"after"});
+  EXPECT_EQ(db->recovery_info().records_replayed, 1);
+}
+
+TEST_F(PersistTest, FailedClearChangesNothing) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  ASSERT_TRUE(db->Set("b", "2", seconds(10)).ok());
+  const std::string before = file_.data();
+
+  storage_->FailReplaceBegin(true);
+  EXPECT_EQ(db->Clear().code(), StatusCode::kIoError);
+  storage_->FailReplaceBegin(false);
+  storage_->FailReplaceCommit(true);
+  EXPECT_EQ(db->Clear().code(), StatusCode::kIoError);
+
+  EXPECT_EQ(file_.data(), before);  // the log is untouched...
+  EXPECT_EQ(db->Keys(),
+            (std::vector<std::string>{"a", "b"}));  // ...and so is memory
+  EXPECT_EQ(db->GetTtl("b").remaining, seconds(10));
+  ASSERT_TRUE(db->Set("c", "3").ok());  // and the Db still works
+
+  storage_->FailReplaceCommit(false);
+  ASSERT_TRUE(db->Clear().ok());
+  EXPECT_EQ(db->Size(), 0);
+}
+
+TEST_F(PersistTest, RejectedWritesLogNothing) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  const uint64_t size = file_.Size();
+  const std::string big_key(Db::kMaxKeySize + 1, 'k');
+  EXPECT_FALSE(db->Set(big_key, "v").ok());
+  EXPECT_FALSE(db->Append(big_key, "v").ok());
+  EXPECT_FALSE(db->Rename("a", big_key).ok());
+  EXPECT_FALSE(*db->Rename("missing", "x"));
+  EXPECT_TRUE(*db->Rename("a", "a"));  // renaming onto itself is a no-op
+  EXPECT_EQ(file_.Size(), size);
 }
 
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
@@ -589,7 +735,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(8)) {
+      switch (pick(12)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -630,12 +776,39 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(persistent->Compact().ok());
           }
           break;
+        case 8: {
+          const std::string suffix = std::to_string(pick(100));
+          StatusOr<size_t> a = persistent->Append(k, suffix);
+          StatusOr<size_t> b = reference.Append(k, suffix);
+          ASSERT_TRUE(a.ok() && b.ok());
+          EXPECT_EQ(*a, *b);
+          break;
+        }
+        case 9: {
+          const std::string to = key();
+          EXPECT_EQ(*persistent->Rename(k, to), *reference.Rename(k, to));
+          break;
+        }
+        case 10:
+          if (pick(40) == 0) {
+            ASSERT_TRUE(persistent->Clear().ok());
+            ASSERT_TRUE(reference.Clear().ok());
+          }
+          break;
+        case 11:
+          if (pick(10) == 0) {
+            EXPECT_EQ(persistent->Keys(), reference.Keys());
+            const std::string prefix = "k" + std::to_string(pick(8));
+            EXPECT_EQ(persistent->Keys(prefix), reference.Keys(prefix));
+          }
+          break;
       }
     }
 
     persistent.reset();
     auto reopened = Open();  // same fake time: no restart
     ASSERT_NE(reopened, nullptr);
+    EXPECT_EQ(reopened->Keys(), reference.Keys()) << "seed=" << seed;
     for (int i = 0; i < 8; ++i) {
       const std::string k = "k" + std::to_string(i);
       EXPECT_EQ(reopened->Get(k), reference.Get(k))
