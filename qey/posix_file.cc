@@ -28,8 +28,9 @@ Status IoError(std::string_view what, int err) {
 
 bool FullSync(int fd) {
 #if defined(__APPLE__)
+  // Plain fsync does not flush the drive's write cache on macOS. Not every
+  // file system supports F_FULLFSYNC, so fall back to fsync if it fails.
   if (::fcntl(fd, F_FULLFSYNC) == 0) return true;
-  // Not every file system supports F_FULLFSYNC; fall back to fsync.
 #endif
   return ::fsync(fd) == 0;
 }
