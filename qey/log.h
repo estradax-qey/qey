@@ -37,6 +37,10 @@ struct Record {
     // They share one checksum, so a crash cannot leave part of them in the
     // log. May not be nested, and may not be empty.
     kBatch = 7,
+    // key, value: replaces the value and keeps the key's TTL, creating the key
+    // without one if it is missing. For changes such as Incr() that must not
+    // touch the expiry.
+    kReplace = 8,
   };
 
   Record() = default;
@@ -49,7 +53,7 @@ struct Record {
 
   Type type = Type::kSet;
   std::string key;
-  std::string value;  // kSet, kAppend and kRename only.
+  std::string value;  // kSet, kAppend, kRename and kReplace only.
   // Absolute expiry as Unix milliseconds (>= 0). Used by kSet (nullopt means
   // no expiry) and kExpire (required).
   std::optional<int64_t> expires_at_ms;

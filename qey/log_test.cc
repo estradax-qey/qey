@@ -32,6 +32,9 @@ Record Append(std::string key, std::string suffix) {
 Record Rename(std::string from, std::string to) {
   return Record{Type::kRename, std::move(from), std::move(to), {}};
 }
+Record Replace(std::string key, std::string value) {
+  return Record{Type::kReplace, std::move(key), std::move(value), {}};
+}
 Record Batch(std::vector<Record> records) {
   Record r;
   r.type = Type::kBatch;
@@ -55,6 +58,9 @@ std::vector<Record> SampleRecords() {
       Append("", ""),
       Batch({Set("x", "1", 5), Del("y"), Rename("x", "z"), Append("z", "!")}),
       Batch({Persist("z")}),
+      Replace("a", "42"),
+      Replace("", ""),
+      Batch({Replace("k", "1"), Set("j", "2")}),
       Del("a"),
   };
 }
@@ -265,7 +271,9 @@ TEST(ReplayTest, ValidChecksumWithMalformedBodyIsCorruption) {
   const std::vector<std::string> bad_bodies = {
       std::string("\x01", 1),                   // kSet with no fields
       std::string("\x63", 1),                   // unknown type 99
-      std::string("\x07", 1),                   // first unassigned type
+      std::string("\x08\1\0\0\0k", 6),          // kReplace without its value
+      std::string("\x7f", 1),                   // an unassigned type
+      std::string("\xff", 1),                   // far outside the known types
       std::string("\x05\1\0\0\0k", 6),          // kAppend without its value
       std::string("\x06\1\0\0\0k", 6),          // kRename without its new key
       std::string("\x02\1\0\0\0k!", 7),         // kDel with trailing byte

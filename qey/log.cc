@@ -84,7 +84,7 @@ class PayloadReader {
 
 bool HasValue(Record::Type type) {
   return type == Record::Type::kSet || type == Record::Type::kAppend ||
-         type == Record::Type::kRename;
+         type == Record::Type::kRename || type == Record::Type::kReplace;
 }
 
 bool HasExpiry(Record::Type type) {
@@ -96,7 +96,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 7) return false;
+  if (type < 1 || type > 8) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -170,7 +170,8 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kBatch) {
+  if (record.type < Record::Type::kSet ||
+      record.type > Record::Type::kReplace) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
