@@ -203,6 +203,43 @@ class Db {
   // store prefer Scan().
   std::vector<std::string> Keys(std::string_view prefix = "");
 
+  // ---- Hashes ----
+  //
+  // A hash maps fields to values. Fields are kept in byte order. Removing the
+  // last field removes the key. These fail with kWrongType if the key holds
+  // something other than a hash, and with kInvalidArgument if a key, field or
+  // value exceeds its size limit.
+
+  // Sets fields. Returns how many of them are new (an existing field has its
+  // value replaced). If a field is repeated, the last value wins.
+  StatusOr<size_t> HSet(std::string_view key, std::string_view field,
+                        std::string_view value);
+  StatusOr<size_t> HSet(std::string_view key,
+                        const std::vector<FieldValue>& fields);
+
+  // Returns the value of `field`, or std::nullopt if the field or key is
+  // missing.
+  StatusOr<std::optional<std::string>> HGet(std::string_view key,
+                                            std::string_view field);
+
+  // Removes fields. Returns how many were there.
+  StatusOr<size_t> HDel(std::string_view key,
+                        const std::vector<std::string>& fields);
+
+  StatusOr<bool> HExists(std::string_view key, std::string_view field);
+
+  // The number of fields; 0 for a missing key.
+  StatusOr<size_t> HLen(std::string_view key);
+
+  // All fields and values, in field order; empty for a missing key.
+  StatusOr<std::vector<FieldValue>> HGetAll(std::string_view key);
+
+  // Adds `delta` to the integer in `field` (a missing field or key counts as
+  // 0) and returns the result. Fails with kNotInteger or kOutOfRange like
+  // Incr().
+  StatusOr<int64_t> HIncr(std::string_view key, std::string_view field,
+                          int64_t delta = 1);
+
   // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
   // byte order, starting after `after` (or from the beginning if empty).
   // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
@@ -366,8 +403,22 @@ class Db {
   // that the batch can be undone. A nullopt value means the key did not exist.
   using Undo = std::map<std::string, std::optional<Entry>, std::less<>>;
 
-  static WriteBatch::Op MakeOp(WriteBatch::Op::Type type, std::string_view key,
-                               std::string_view arg = "");
+  // The live entry for `key` if it holds `type`, or map_.end() if there is
+  // none. Fails with kWrongType if the key holds something else. Requires
+  // `mu_` held.
+  Status FindOfType(std::string_view key, KeyType type, Map::iterator* it);
+
+  // The entry for `key` if it holds `type`, creating an empty collection if
+  // there is none and `create` is set. Returns map_.end() if the key holds a
+  // different type. For applying records; does not check expiry. Requires
+  // `mu_` held.
+  Map::iterator CollectionLocked(std::string_view key, KeyType type,
+                                 bool create);
+
+  // Appends the records that recreate one entry to `buf`, writing `buf` out
+  // to `out` whenever it grows large. For compaction.
+  Status WriteEntryRecords(const std::string& key, const Entry& entry,
+                           const ClockPoint& ref, std::string* buf, File& out);
 
   // Checks what can be checked about `op` without looking at the data.
   static Status ValidateOp(const WriteBatch::Op& op);

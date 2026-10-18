@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "qey/value.h"
+
 namespace qey {
 
 // A list of changes to apply together with Db::Write(). Building a batch does
@@ -30,28 +32,64 @@ class WriteBatch {
   // Db::Append(), Db::Rename(), Db::Incr() and Db::Decr().
   WriteBatch& Set(std::string_view key, std::string_view value,
                   std::optional<std::chrono::milliseconds> ttl = std::nullopt) {
-    return Add(Op::Type::kSet, key, value, ttl, 0);
+    Op op = MakeOp(Op::Type::kSet, key, value);
+    op.ttl = ttl;
+    return Add(std::move(op));
   }
   WriteBatch& Del(std::string_view key) {
-    return Add(Op::Type::kDel, key, "", std::nullopt, 0);
+    return Add(MakeOp(Op::Type::kDel, key));
   }
   WriteBatch& Expire(std::string_view key, std::chrono::milliseconds ttl) {
-    return Add(Op::Type::kExpire, key, "", ttl, 0);
+    Op op = MakeOp(Op::Type::kExpire, key);
+    op.ttl = ttl;
+    return Add(std::move(op));
   }
   WriteBatch& Persist(std::string_view key) {
-    return Add(Op::Type::kPersist, key, "", std::nullopt, 0);
+    return Add(MakeOp(Op::Type::kPersist, key));
   }
   WriteBatch& Append(std::string_view key, std::string_view suffix) {
-    return Add(Op::Type::kAppend, key, suffix, std::nullopt, 0);
+    return Add(MakeOp(Op::Type::kAppend, key, suffix));
   }
   WriteBatch& Rename(std::string_view from, std::string_view to) {
-    return Add(Op::Type::kRename, from, to, std::nullopt, 0);
+    return Add(MakeOp(Op::Type::kRename, from, to));
   }
   WriteBatch& Incr(std::string_view key, int64_t delta = 1) {
-    return Add(Op::Type::kIncr, key, "", std::nullopt, delta);
+    Op op = MakeOp(Op::Type::kIncr, key);
+    op.n1 = delta;
+    return Add(std::move(op));
   }
   WriteBatch& Decr(std::string_view key, int64_t delta = 1) {
-    return Add(Op::Type::kDecr, key, "", std::nullopt, delta);
+    Op op = MakeOp(Op::Type::kDecr, key);
+    op.n1 = delta;
+    return Add(std::move(op));
+  }
+
+  // Hashes. The same as Db::HSet(), Db::HDel() and Db::HIncr().
+  WriteBatch& HSet(std::string_view key, std::string_view field,
+                   std::string_view value) {
+    return HSet(
+        key, std::vector<FieldValue>{{std::string(field), std::string(value)}});
+  }
+  WriteBatch& HSet(std::string_view key,
+                   const std::vector<FieldValue>& fields) {
+    Op op = MakeOp(Op::Type::kHSet, key);
+    for (const FieldValue& fv : fields) {
+      op.items.push_back(fv.first);
+      op.items.push_back(fv.second);
+    }
+    return Add(std::move(op));
+  }
+  WriteBatch& HDel(std::string_view key,
+                   const std::vector<std::string>& fields) {
+    Op op = MakeOp(Op::Type::kHDel, key);
+    op.items = fields;
+    return Add(std::move(op));
+  }
+  WriteBatch& HIncr(std::string_view key, std::string_view field,
+                    int64_t delta = 1) {
+    Op op = MakeOp(Op::Type::kHIncr, key, field);
+    op.n1 = delta;
+    return Add(std::move(op));
   }
 
   // Removes all changes from the batch.
@@ -75,6 +113,9 @@ class WriteBatch {
       kRename,
       kIncr,
       kDecr,
+      kHSet,
+      kHDel,
+      kHIncr,
     };
 
     Type type = Type::kSet;
@@ -82,17 +123,21 @@ class WriteBatch {
     // The value for kSet, the suffix for kAppend, the new key for kRename.
     std::string arg;
     std::optional<std::chrono::milliseconds> ttl;  // kSet, kExpire.
-    int64_t n1 = 0;                                // kIncr, kDecr: the delta.
+    // kHSet: fields and values, alternating. kHDel: the fields.
+    std::vector<std::string> items;
+    int64_t n1 = 0;  // kIncr, kDecr, kHIncr: the delta.
   };
 
-  WriteBatch& Add(Op::Type type, std::string_view key, std::string_view arg,
-                  std::optional<std::chrono::milliseconds> ttl, int64_t n1) {
+  static Op MakeOp(Op::Type type, std::string_view key,
+                   std::string_view arg = "") {
     Op op;
     op.type = type;
     op.key = std::string(key);
     op.arg = std::string(arg);
-    op.ttl = ttl;
-    op.n1 = n1;
+    return op;
+  }
+
+  WriteBatch& Add(Op op) {
     ops_.push_back(std::move(op));
     return *this;
   }

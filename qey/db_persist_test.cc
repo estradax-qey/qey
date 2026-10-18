@@ -282,6 +282,34 @@ TEST_F(PersistTest, RejectedWritesLogNothing) {
 
 std::vector<std::string> KeysOf(Db& db) { return db.Keys(); }
 
+// A readable description of what `key` holds, to compare two Dbs.
+std::string Dump(Db& db, const std::string& key) {
+  switch (db.Type(key)) {
+    case KeyType::kNone:
+      return "none";
+    case KeyType::kString:
+      return "string:" + *db.Get(key);
+    case KeyType::kHash: {
+      std::string out = "hash:";
+      // Hold the result: iterating `*db.HGetAll(key)` directly would loop over
+      // a vector inside a temporary that is already gone.
+      StatusOr<std::vector<FieldValue>> all = db.HGetAll(key);
+      for (const auto& [field, value] : *all) out += field + "=" + value + ";";
+      return out;
+    }
+    default:
+      return "?";
+  }
+}
+
+// Two calls on two Dbs that should agree must fail the same way, or both
+// succeed with the same result.
+template <typename T>
+void ExpectSame(const StatusOr<T>& a, const StatusOr<T>& b) {
+  EXPECT_EQ(a.status().code(), b.status().code());
+  if (a.ok() && b.ok()) EXPECT_EQ(*a, *b);
+}
+
 TEST_F(PersistTest, BatchSurvivesReopenAsOneRecord) {
   uint64_t before;
   {
@@ -451,6 +479,119 @@ TEST_F(PersistTest, TtlsDoNotDriftWhenTheWallClockMovesBetweenReads) {
   ASSERT_TRUE(db->Compact().ok());  // and compaction keeps them as they were
   EXPECT_EQ(db->GetTtl("a").remaining, seconds(10));
   EXPECT_EQ(db->GetTtl("n").remaining, seconds(40));
+}
+
+TEST_F(PersistTest, HashesAndTheirTtlsSurviveRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->HSet("h", {{"a", "1"}, {"b", "2"}, {"c", "3"}}).ok());
+    ASSERT_TRUE(db->HSet("h", "b", "20").ok());
+    ASSERT_EQ(*db->HDel("h", {"c"}), 1);
+    ASSERT_EQ(*db->HIncr("h", "n", 5), 5);
+    ASSERT_TRUE(*db->Expire("h", seconds(100)));
+    ASSERT_TRUE(db->HSet("gone", "f", "v").ok());
+    ASSERT_EQ(*db->HDel("gone", {"f"}), 1);  // empties the hash: key removed
+  }
+  Restart(seconds(40));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "h"), "hash:a=1;b=20;n=5;");
+  EXPECT_EQ(db->GetTtl("h").remaining, seconds(60));
+  EXPECT_EQ(db->Type("gone"), KeyType::kNone);
+  EXPECT_EQ(db->Keys(), std::vector<std::string>{"h"});
+}
+
+TEST_F(PersistTest, ANewHashDoesNotInheritAStaleExpiredEntryAfterRestart) {
+  // "k" expires without anyone touching it, so the log still holds the old
+  // value and its deadline. Creating a hash under that name afterwards has to
+  // replace all of it, or recovery would merge into (or discard) the stale
+  // entry and disagree with what the live Db showed.
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->HSet("h", {{"old", "1"}, {"older", "2"}}).ok());
+    ASSERT_TRUE(*db->Expire("h", seconds(10)));
+    ASSERT_TRUE(db->Set("s", "string", seconds(10)).ok());
+    ASSERT_TRUE(db->Set("t", "string", seconds(10)).ok());
+    Advance(seconds(10));  // all three expire, unnoticed
+
+    ASSERT_EQ(*db->HSet("h", "new", "3"), 1);   // stale hash
+    ASSERT_EQ(*db->HSet("s", "f", "v"), 1);     // stale string
+    ASSERT_EQ(*db->HIncr("t", "count", 4), 4);  // stale string, via HIncr
+    ASSERT_EQ(Dump(*db, "h"), "hash:new=3;");
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "h"), "hash:new=3;");
+  EXPECT_EQ(Dump(*db, "s"), "hash:f=v;");
+  EXPECT_EQ(Dump(*db, "t"), "hash:count=4;");
+  for (const char* k : {"h", "s", "t"}) {
+    EXPECT_EQ(db->GetTtl(k).state, Db::TtlState::kNoExpiry) << k;
+  }
+}
+
+TEST_F(PersistTest, CompactionKeepsHashesInPiecesThatFitARecord) {
+  // About 3 MB of fields: more than one compaction chunk.
+  std::vector<FieldValue> fields;
+  for (int i = 0; i < 30000; ++i) {
+    fields.emplace_back("field-" + std::to_string(100000 + i),
+                        std::string(90, static_cast<char>('a' + i % 26)));
+  }
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->HSet("big", fields).ok());
+    ASSERT_TRUE(*db->Expire("big", seconds(500)));
+    ASSERT_TRUE(db->HSet("small", "f", "v").ok());
+    ASSERT_TRUE(db->Compact().ok());
+    EXPECT_EQ(storage_->replace_count(), 1);
+  }
+  Restart(seconds(100));
+  auto db = Open();
+  EXPECT_EQ(*db->HLen("big"), 30000);
+  EXPECT_EQ(*db->HGetAll("big"), fields);
+  EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
+  EXPECT_EQ(Dump(*db, "small"), "hash:f=v;");
+  // Several records, not one: the big hash was split.
+  EXPECT_GE(db->recovery_info().records_replayed, 4);
+}
+
+TEST_F(PersistTest, HashBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->HSet("h", {{"a", "1"}}).ok());
+    before = file_.Size();
+    WriteBatch batch;
+    batch.HSet("h", "b", "2")
+        .HDel("h", {"a"})
+        .HSet("g", "x", "y")
+        .HIncr("g", "n");
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  const std::string full = file_.data();
+  for (uint64_t cut = before; cut <= full.size(); ++cut) {
+    MemFile crashed(full.substr(0, cut));
+    StatusOr<std::unique_ptr<Db>> db =
+        Db::Open(std::make_unique<MemStorage>(&crashed), Options());
+    ASSERT_TRUE(db.ok()) << "cut=" << cut;
+    if (cut < full.size()) {
+      EXPECT_EQ(Dump(**db, "h"), "hash:a=1;") << "cut=" << cut;
+      EXPECT_EQ(Dump(**db, "g"), "none") << "cut=" << cut;
+    } else {
+      EXPECT_EQ(Dump(**db, "h"), "hash:b=2;");
+      EXPECT_EQ(Dump(**db, "g"), "hash:n=1;x=y;");
+    }
+  }
+}
+
+TEST_F(PersistTest, FailedHashWritesAreUndone) {
+  auto db = Open();
+  ASSERT_TRUE(db->HSet("h", {{"a", "1"}}).ok());
+  const uint64_t size = file_.Size();
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->HSet("h", "b", "2").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->HDel("h", {"a"}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->HIncr("h", "n").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_EQ(Dump(*db, "h"), "hash:a=1;");
 }
 
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
@@ -926,7 +1067,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(13)) {
+      switch (pick(14)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -969,10 +1110,8 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           break;
         case 8: {
           const std::string suffix = std::to_string(pick(100));
-          StatusOr<size_t> a = persistent->Append(k, suffix);
-          StatusOr<size_t> b = reference.Append(k, suffix);
-          ASSERT_TRUE(a.ok() && b.ok());
-          EXPECT_EQ(*a, *b);
+          ExpectSame(persistent->Append(k, suffix),
+                     reference.Append(k, suffix));
           break;
         }
         case 9: {
@@ -986,12 +1125,44 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 13: {
+          const std::string field = "f" + std::to_string(pick(4));
+          switch (pick(3)) {
+            case 0: {
+              const std::string v = std::to_string(pick(50));
+              ExpectSame(persistent->HSet(k, field, v),
+                         reference.HSet(k, field, v));
+              break;
+            }
+            case 1:
+              ExpectSame(persistent->HDel(k, {field}),
+                         reference.HDel(k, {field}));
+              break;
+            case 2: {
+              const int64_t delta = pick(21) - 10;
+              ExpectSame(persistent->HIncr(k, field, delta),
+                         reference.HIncr(k, field, delta));
+              break;
+            }
+          }
+          break;
+        }
         case 12: {
           WriteBatch batch;
           const int n = 1 + pick(4);
           for (int j = 0; j < n; ++j) {
             const std::string bk = key();
-            switch (pick(8)) {
+            switch (pick(11)) {
+              case 8:
+                batch.HSet(bk, "f" + std::to_string(pick(4)),
+                           std::to_string(pick(50)));
+                break;
+              case 9:
+                batch.HDel(bk, {"f" + std::to_string(pick(4))});
+                break;
+              case 10:
+                batch.HIncr(bk, "f" + std::to_string(pick(4)), pick(21) - 10);
+                break;
               case 0:
                 batch.Set(bk, std::to_string(pick(100)));
                 break;
@@ -1044,6 +1215,8 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
     EXPECT_EQ(reopened->Keys(), reference.Keys()) << "seed=" << seed;
     for (int i = 0; i < 8; ++i) {
       const std::string k = "k" + std::to_string(i);
+      EXPECT_EQ(Dump(*reopened, k), Dump(reference, k))
+          << "seed=" << seed << " " << k;
       EXPECT_EQ(reopened->Get(k), reference.Get(k))
           << "seed=" << seed << " " << k;
       Db::TtlInfo a = reopened->GetTtl(k);

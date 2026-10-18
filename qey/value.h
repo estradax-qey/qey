@@ -23,6 +23,9 @@ enum class KeyType {
   kZSet,
 };
 
+// A hash field and its value.
+using FieldValue = std::pair<std::string, std::string>;
+
 using List = std::deque<std::string>;
 // Ordered, so that listing a hash or set is deterministic. The transparent
 // comparison lets lookups take a string_view without allocating.

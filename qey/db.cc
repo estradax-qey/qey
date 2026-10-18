@@ -182,7 +182,8 @@ Status Db::Recover(Recovery recovery) {
 
 Status Db::Set(std::string_view key, std::string_view value,
                std::optional<std::chrono::milliseconds> ttl) {
-  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kSet, key, value);
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kSet, key, value);
   op.ttl = ttl;
   return Run(op).status();
 }
@@ -203,13 +204,14 @@ KeyType Db::Type(std::string_view key) {
 }
 
 StatusOr<bool> Db::Del(std::string_view key) {
-  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kDel, key));
+  StatusOr<OpResult> r =
+      Run(WriteBatch::MakeOp(WriteBatch::Op::Type::kDel, key));
   if (!r.ok()) return r.status();
   return r->flag;
 }
 
 StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
-  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kIncr, key);
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kIncr, key);
   op.n1 = delta;
   StatusOr<OpResult> r = Run(op);
   if (!r.ok()) return r.status();
@@ -217,7 +219,90 @@ StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
 }
 
 StatusOr<int64_t> Db::Decr(std::string_view key, int64_t delta) {
-  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kDecr, key);
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kDecr, key);
+  op.n1 = delta;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->integer;
+}
+
+StatusOr<size_t> Db::HSet(std::string_view key, std::string_view field,
+                          std::string_view value) {
+  return HSet(
+      key, std::vector<FieldValue>{{std::string(field), std::string(value)}});
+}
+
+StatusOr<size_t> Db::HSet(std::string_view key,
+                          const std::vector<FieldValue>& fields) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kHSet, key);
+  op.items.reserve(fields.size() * 2);
+  for (const FieldValue& fv : fields) {
+    op.items.push_back(fv.first);
+    op.items.push_back(fv.second);
+  }
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<std::optional<std::string>> Db::HGet(std::string_view key,
+                                              std::string_view field) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kHash, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return std::optional<std::string>();
+  const Hash& hash = it->second.value.hash();
+  auto f = hash.find(field);
+  if (f == hash.end()) return std::optional<std::string>();
+  return std::optional<std::string>(f->second);
+}
+
+StatusOr<size_t> Db::HDel(std::string_view key,
+                          const std::vector<std::string>& fields) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kHDel, key);
+  op.items = fields;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<bool> Db::HExists(std::string_view key, std::string_view field) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kHash, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return false;
+  const Hash& hash = it->second.value.hash();
+  return hash.find(field) != hash.end();
+}
+
+StatusOr<size_t> Db::HLen(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kHash, &it);
+  if (!s.ok()) return s;
+  return it == map_.end() ? size_t{0} : it->second.value.hash().size();
+}
+
+StatusOr<std::vector<FieldValue>> Db::HGetAll(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kHash, &it);
+  if (!s.ok()) return s;
+  std::vector<FieldValue> all;
+  if (it == map_.end()) return all;
+  all.reserve(it->second.value.hash().size());
+  for (const auto& [field, value] : it->second.value.hash()) {
+    all.emplace_back(field, value);
+  }
+  return all;
+}
+
+StatusOr<int64_t> Db::HIncr(std::string_view key, std::string_view field,
+                            int64_t delta) {
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kHIncr, key, field);
   op.n1 = delta;
   StatusOr<OpResult> r = Run(op);
   if (!r.ok()) return r.status();
@@ -248,7 +333,7 @@ bool Db::Exists(std::string_view key) {
 }
 
 StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
-  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kExpire, key);
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kExpire, key);
   op.ttl = ttl;
   StatusOr<OpResult> r = Run(op);
   if (!r.ok()) return r.status();
@@ -256,31 +341,24 @@ StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
 }
 
 StatusOr<bool> Db::Persist(std::string_view key) {
-  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kPersist, key));
+  StatusOr<OpResult> r =
+      Run(WriteBatch::MakeOp(WriteBatch::Op::Type::kPersist, key));
   if (!r.ok()) return r.status();
   return r->flag;
 }
 
 StatusOr<size_t> Db::Append(std::string_view key, std::string_view suffix) {
   StatusOr<OpResult> r =
-      Run(MakeOp(WriteBatch::Op::Type::kAppend, key, suffix));
+      Run(WriteBatch::MakeOp(WriteBatch::Op::Type::kAppend, key, suffix));
   if (!r.ok()) return r.status();
   return r->count;
 }
 
 StatusOr<bool> Db::Rename(std::string_view from, std::string_view to) {
-  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kRename, from, to));
+  StatusOr<OpResult> r =
+      Run(WriteBatch::MakeOp(WriteBatch::Op::Type::kRename, from, to));
   if (!r.ok()) return r.status();
   return r->flag;
-}
-
-WriteBatch::Op Db::MakeOp(WriteBatch::Op::Type type, std::string_view key,
-                          std::string_view arg) {
-  WriteBatch::Op op;
-  op.type = type;
-  op.key = std::string(key);
-  op.arg = std::string(arg);
-  return op;
 }
 
 Status Db::ValidateOp(const WriteBatch::Op& op) {
@@ -292,6 +370,16 @@ Status Db::ValidateOp(const WriteBatch::Op& op) {
   } else if (op.arg.size() > kMaxValueSize) {
     return Status(StatusCode::kInvalidArgument,
                   "value is longer than kMaxValueSize");
+  }
+  for (const std::string& item : op.items) {
+    if (item.size() > kMaxValueSize) {
+      return Status(StatusCode::kInvalidArgument,
+                    "an element is longer than kMaxValueSize");
+    }
+  }
+  if (op.type == WriteBatch::Op::Type::kHSet && op.items.size() % 2 != 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  "hash fields and values come in pairs");
   }
   if (op.ttl.has_value()) return CheckTtl(*op.ttl);
   return Status::Ok();
@@ -395,8 +483,90 @@ Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
                  op.key, std::to_string(*added), std::nullopt};
       break;
     }
+    case Type::kHSet: {
+      if (op.items.empty()) break;
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kHash, &it);
+      if (!s.ok()) return s;
+      const Hash* hash = it == map_.end() ? nullptr : &it->second.value.hash();
+      std::set<std::string_view> new_fields;
+      for (size_t i = 0; i < op.items.size(); i += 2) {
+        if (hash == nullptr || hash->find(op.items[i]) == hash->end()) {
+          new_fields.insert(op.items[i]);
+        }
+      }
+      result->count = new_fields.size();
+      Record r;
+      r.type = Record::Type::kHSet;
+      r.key = op.key;
+      r.items = op.items;
+      r.n1 = it == map_.end() ? 1 : 0;
+      *record = std::move(r);
+      break;
+    }
+    case Type::kHDel: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kHash, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const Hash& hash = it->second.value.hash();
+      std::set<std::string_view> seen;
+      Record r;
+      r.type = Record::Type::kHDel;
+      r.key = op.key;
+      for (const std::string& field : op.items) {
+        if (hash.find(field) != hash.end() && seen.insert(field).second) {
+          r.items.push_back(field);
+        }
+      }
+      if (r.items.empty()) break;
+      result->count = r.items.size();
+      *record = std::move(r);
+      break;
+    }
+    case Type::kHIncr: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kHash, &it);
+      if (!s.ok()) return s;
+      const std::string* current = nullptr;
+      if (it != map_.end()) {
+        const Hash& hash = it->second.value.hash();
+        auto field = hash.find(op.arg);
+        if (field != hash.end()) current = &field->second;
+      }
+      StatusOr<int64_t> added = Added(current, op.n1, /*subtract=*/false);
+      if (!added.ok()) return added.status();
+      result->integer = *added;
+      Record r;
+      r.type = Record::Type::kHSet;
+      r.key = op.key;
+      r.items = {op.arg, std::to_string(*added)};
+      r.n1 = it == map_.end() ? 1 : 0;
+      *record = std::move(r);
+      break;
+    }
   }
   return Status::Ok();
+}
+
+Status Db::FindOfType(std::string_view key, KeyType type, Map::iterator* it) {
+  *it = FindLive(key);
+  if (*it != map_.end() && (*it)->second.value.type() != type) {
+    return WrongType();
+  }
+  return Status::Ok();
+}
+
+Db::Map::iterator Db::CollectionLocked(std::string_view key, KeyType type,
+                                       bool create) {
+  auto it = map_.find(key);
+  if (it == map_.end()) {
+    if (!create) return map_.end();
+    it = InsertLocked(key);
+    it->second.value = Value::Make(type);
+    return it;
+  }
+  return it->second.value.type() == type ? it : map_.end();
 }
 
 Status Db::Write(const WriteBatch& batch) {
@@ -663,22 +833,12 @@ Status Db::CompactLocked(bool empty) {
   const Clock::time_point now = ref.steady;
   Status s = storage_->Replace([&](File& out) -> Status {
     // Batch records so that a big database is not written one call per key.
-    constexpr size_t kFlushBytes = 1 << 20;
     std::string buf = EncodeHeader();
-    for (const auto& [key, entry] : map_) {
-      if (empty) break;
-      if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
-      assert(entry.value.type() == KeyType::kString);
-      Record record{Record::Type::kSet, key, entry.value.str(), std::nullopt};
-      if (entry.expires_at.has_value()) {
-        record.expires_at_ms = ToWallMs(*entry.expires_at, ref);
-      }
-      Status encoded = EncodeRecord(record, &buf);
-      if (!encoded.ok()) return encoded;
-      if (buf.size() >= kFlushBytes) {
-        Status written = out.Append(buf);
+    if (!empty) {
+      for (const auto& [key, entry] : map_) {
+        if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
+        Status written = WriteEntryRecords(key, entry, ref, &buf, out);
         if (!written.ok()) return written;
-        buf.clear();
       }
     }
     return out.Append(buf);
@@ -688,6 +848,70 @@ Status Db::CompactLocked(bool empty) {
   unsynced_ = false;
   last_sync_ = now_();
   SetCompactThreshold(storage_->log().Size());
+  return Status::Ok();
+}
+
+Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
+                             const ClockPoint& ref, std::string* buf,
+                             File& out) {
+  constexpr size_t kFlushBytes = 1 << 20;
+  // Collections are written in pieces so that no record outgrows the limit.
+  constexpr size_t kChunkBytes = 1 << 20;
+
+  auto emit = [&](const Record& record) -> Status {
+    Status s = EncodeRecord(record, buf);
+    if (!s.ok()) return s;
+    if (buf->size() >= kFlushBytes) {
+      s = out.Append(*buf);
+      buf->clear();
+    }
+    return s;
+  };
+
+  const Value& value = entry.value;
+  switch (value.type()) {
+    case KeyType::kString: {
+      // A string carries its own expiry.
+      Record record{Record::Type::kSet, key, value.str(), std::nullopt};
+      if (entry.expires_at.has_value()) {
+        record.expires_at_ms = ToWallMs(*entry.expires_at, ref);
+      }
+      return emit(record);
+    }
+    case KeyType::kHash: {
+      Record chunk;
+      chunk.type = Record::Type::kHSet;
+      chunk.key = key;
+      chunk.n1 = 1;  // the first chunk starts the hash; later ones add to it
+      size_t bytes = 0;
+      auto flush = [&]() -> Status {
+        if (chunk.items.empty()) return Status::Ok();
+        Status s = emit(chunk);
+        chunk.items.clear();
+        chunk.n1 = 0;
+        bytes = 0;
+        return s;
+      };
+      for (const auto& [field, field_value] : value.hash()) {
+        chunk.items.push_back(field);
+        chunk.items.push_back(field_value);
+        bytes += field.size() + field_value.size() + 8;
+        if (bytes >= kChunkBytes) {
+          Status s = flush();
+          if (!s.ok()) return s;
+        }
+      }
+      Status s = flush();
+      if (!s.ok()) return s;
+      break;
+    }
+    default:
+      return Status(StatusCode::kInvalidArgument, "unsupported value type");
+  }
+  if (entry.expires_at.has_value()) {
+    return emit(Record{Record::Type::kExpire, key, "",
+                       ToWallMs(*entry.expires_at, ref)});
+  }
   return Status::Ok();
 }
 
@@ -731,6 +955,32 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
       if (it->second.value.type() == KeyType::kString) {
         it->second.value.str().append(record.value);
       }
+      break;
+    }
+    case Record::Type::kHSet: {
+      Map::iterator it;
+      if (record.n1 == 1) {
+        // The key was new: whatever the log still has under this name is a
+        // stale entry that had already expired.
+        it = InsertLocked(record.key);
+        ClearExpiryLocked(it);
+        it->second.value = Value::Make(KeyType::kHash);
+      } else {
+        it = CollectionLocked(record.key, KeyType::kHash, /*create=*/true);
+        if (it == map_.end()) break;
+      }
+      Hash& hash = it->second.value.hash();
+      for (size_t i = 0; i + 1 < record.items.size(); i += 2) {
+        hash[std::move(record.items[i])] = std::move(record.items[i + 1]);
+      }
+      break;
+    }
+    case Record::Type::kHDel: {
+      auto it = CollectionLocked(record.key, KeyType::kHash, /*create=*/false);
+      if (it == map_.end()) break;
+      Hash& hash = it->second.value.hash();
+      for (const std::string& field : record.items) hash.erase(field);
+      if (hash.empty()) EraseLocked(it);
       break;
     }
     case Record::Type::kReplace: {

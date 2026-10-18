@@ -763,6 +763,215 @@ TEST_F(DbTest, IncrAndDecrNeverShortenAKeysTtl) {
   EXPECT_EQ(db_.GetTtl("m").remaining, seconds(10) - milliseconds(50));
 }
 
+using Pairs = std::vector<FieldValue>;
+
+TEST_F(DbTest, HashSetCountsOnlyNewFields) {
+  EXPECT_EQ(*db_.HSet("h", "a", "1"), 1);
+  EXPECT_EQ(*db_.HSet("h", "a", "2"), 0);  // an existing field
+  // "b" is new once, though it appears twice; "a" is not new; last value wins.
+  EXPECT_EQ(*db_.HSet("h", {{"b", "2"}, {"a", "9"}, {"b", "3"}}), 1);
+  EXPECT_EQ(**db_.HGet("h", "a"), "9");
+  EXPECT_EQ(**db_.HGet("h", "b"), "3");
+  EXPECT_EQ(*db_.HLen("h"), 2);
+  EXPECT_EQ(*db_.HGetAll("h"), (Pairs{{"a", "9"}, {"b", "3"}}));
+  EXPECT_EQ(*db_.HSet("h", Pairs{}), 0);  // nothing to set
+  EXPECT_EQ(db_.Type("h"), KeyType::kHash);
+}
+
+TEST_F(DbTest, HashFieldsAreOrderedAndHoldAnyBytes) {
+  ASSERT_TRUE(db_.HSet("h", {{"b", ""},
+                             {"", "empty field"},
+                             {std::string("\0x", 2), std::string("\0", 1)},
+                             {"a", "va"}})
+                  .ok());
+  Pairs all = *db_.HGetAll("h");
+  ASSERT_EQ(all.size(), 4);
+  EXPECT_EQ(all[0], (FieldValue{"", "empty field"}));
+  EXPECT_EQ(all[1], (FieldValue{std::string("\0x", 2), std::string("\0", 1)}));
+  EXPECT_EQ(all[2], (FieldValue{"a", "va"}));
+  EXPECT_EQ(all[3], (FieldValue{"b", ""}));
+}
+
+TEST_F(DbTest, MissingHashAndFieldReadAsEmpty) {
+  EXPECT_FALSE((*db_.HGet("nope", "f")).has_value());
+  EXPECT_FALSE(*db_.HExists("nope", "f"));
+  EXPECT_EQ(*db_.HLen("nope"), 0);
+  EXPECT_TRUE(db_.HGetAll("nope")->empty());
+  EXPECT_EQ(*db_.HDel("nope", {"f"}), 0);
+  ASSERT_TRUE(db_.HSet("h", "a", "1").ok());
+  EXPECT_FALSE((*db_.HGet("h", "zzz")).has_value());
+  EXPECT_FALSE(*db_.HExists("h", "zzz"));
+  EXPECT_TRUE(*db_.HExists("h", "a"));
+  EXPECT_EQ(db_.Type("nope"), KeyType::kNone);
+}
+
+TEST_F(DbTest, HDelCountsDistinctPresentFieldsAndRemovesAnEmptiedKey) {
+  ASSERT_TRUE(db_.HSet("h", {{"a", "1"}, {"b", "2"}, {"c", "3"}}).ok());
+  EXPECT_EQ(*db_.HDel("h", {"a", "a", "nope"}), 1);
+  EXPECT_EQ(*db_.HLen("h"), 2);
+  EXPECT_EQ(*db_.HDel("h", {"nope"}), 0);
+  EXPECT_EQ(*db_.HDel("h", std::vector<std::string>{}), 0);
+  ASSERT_TRUE(db_.Keys().size() == 1);
+
+  EXPECT_EQ(*db_.HDel("h", {"b", "c"}), 2);
+  EXPECT_EQ(db_.Type("h"), KeyType::kNone);  // the last field took the key
+  EXPECT_FALSE(db_.Exists("h"));
+  EXPECT_EQ(db_.Keys(), Keys{});
+  EXPECT_EQ(db_.Size(), 0);
+}
+
+TEST_F(DbTest, HIncrCreatesAddsAndRejectsBadValues) {
+  EXPECT_EQ(*db_.HIncr("h", "n", 5), 5);  // creates the hash and the field
+  EXPECT_EQ(*db_.HIncr("h", "n"), 6);
+  EXPECT_EQ(*db_.HIncr("h", "m", -2), -2);  // new field in an existing hash
+  EXPECT_EQ(**db_.HGet("h", "n"), "6");
+
+  ASSERT_TRUE(db_.HSet("h", "text", "abc").ok());
+  EXPECT_EQ(db_.HIncr("h", "text").status().code(), StatusCode::kNotInteger);
+  EXPECT_EQ(**db_.HGet("h", "text"), "abc");
+
+  ASSERT_TRUE(
+      db_.HSet("h", "big", std::to_string(std::numeric_limits<int64_t>::max()))
+          .ok());
+  EXPECT_EQ(db_.HIncr("h", "big").status().code(), StatusCode::kOutOfRange);
+}
+
+TEST_F(DbTest, HIncrOnAMissingKeyThatFailsLeavesNoKey) {
+  EXPECT_EQ(*db_.HIncr("fresh", "f", std::numeric_limits<int64_t>::max()),
+            std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(db_.HIncr("fresh", "f", 1).status().code(),
+            StatusCode::kOutOfRange);
+  EXPECT_EQ(*db_.HLen("fresh"), 1);
+}
+
+TEST_F(DbTest, EveryOperationChecksTheTypeOfTheKey) {
+  Set("s", "string");
+  ASSERT_TRUE(db_.HSet("h", "f", "v").ok());
+  const StatusCode wrong = StatusCode::kWrongType;
+
+  // Hash commands on a string.
+  EXPECT_EQ(db_.HSet("s", "f", "v").status().code(), wrong);
+  EXPECT_EQ(db_.HGet("s", "f").status().code(), wrong);
+  EXPECT_EQ(db_.HDel("s", {"f"}).status().code(), wrong);
+  EXPECT_EQ(db_.HExists("s", "f").status().code(), wrong);
+  EXPECT_EQ(db_.HLen("s").status().code(), wrong);
+  EXPECT_EQ(db_.HGetAll("s").status().code(), wrong);
+  EXPECT_EQ(db_.HIncr("s", "f").status().code(), wrong);
+  EXPECT_EQ(db_.Get("s"), "string");  // untouched
+
+  // String commands on a hash.
+  EXPECT_EQ(db_.Append("h", "x").status().code(), wrong);
+  EXPECT_EQ(db_.Incr("h").status().code(), wrong);
+  EXPECT_EQ(db_.Decr("h").status().code(), wrong);
+  EXPECT_EQ(db_.Get("h"), std::nullopt);
+  EXPECT_EQ(db_.MGet({"s", "h"}),
+            (std::vector<std::optional<std::string>>{"string", std::nullopt}));
+  EXPECT_EQ(*db_.HGetAll("h"), (Pairs{{"f", "v"}}));  // untouched
+
+  // Commands that work on any type.
+  EXPECT_TRUE(db_.Exists("h"));
+  EXPECT_EQ(db_.Type("h"), KeyType::kHash);
+  EXPECT_EQ(db_.Type("s"), KeyType::kString);
+  EXPECT_TRUE(*db_.Expire("h", milliseconds(100)));
+  EXPECT_EQ(db_.GetTtl("h").remaining, milliseconds(100));
+  EXPECT_TRUE(*db_.Persist("h"));
+  EXPECT_TRUE(*db_.Rename("h", "h2"));
+  EXPECT_EQ(db_.Type("h2"), KeyType::kHash);
+  EXPECT_TRUE(*db_.Del("h2"));
+}
+
+TEST_F(DbTest, SettingAStringReplacesAHashAndItsTtl) {
+  ASSERT_TRUE(db_.HSet("k", {{"a", "1"}, {"b", "2"}}).ok());
+  ASSERT_TRUE(*db_.Expire("k", milliseconds(100)));
+  Set("k", "now a string");
+  EXPECT_EQ(db_.Type("k"), KeyType::kString);
+  EXPECT_EQ(db_.Get("k"), "now a string");
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, AHashExpiresAsAWholeAndAnExpiredOneStartsOverEmpty) {
+  ASSERT_TRUE(db_.HSet("h", {{"a", "1"}, {"b", "2"}}).ok());
+  ASSERT_TRUE(*db_.Expire("h", milliseconds(100)));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Type("h"), KeyType::kNone);
+  EXPECT_TRUE(db_.HGetAll("h")->empty());
+
+  // Writing again must not bring back the old fields or the old TTL.
+  EXPECT_EQ(*db_.HSet("h", "c", "3"), 1);
+  EXPECT_EQ(*db_.HGetAll("h"), (Pairs{{"c", "3"}}));
+  EXPECT_EQ(db_.GetTtl("h").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, RenamingAHashKeepsItsFieldsAndTtl) {
+  ASSERT_TRUE(db_.HSet("a", {{"x", "1"}, {"y", "2"}}).ok());
+  ASSERT_TRUE(*db_.Expire("a", milliseconds(100)));
+  Set("b", "old");
+  ASSERT_TRUE(*db_.Rename("a", "b"));  // replaces a string with a hash
+  EXPECT_EQ(db_.Type("b"), KeyType::kHash);
+  EXPECT_EQ(*db_.HGetAll("b"), (Pairs{{"x", "1"}, {"y", "2"}}));
+  EXPECT_EQ(db_.GetTtl("b").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Keys(), Keys{"b"});
+}
+
+TEST_F(DbTest, OversizedHashElementsAreRejected) {
+  const std::string big_key(Db::kMaxKeySize + 1, 'k');
+  EXPECT_EQ(db_.HSet(big_key, "f", "v").status().code(),
+            StatusCode::kInvalidArgument);
+  std::string big(Db::kMaxValueSize + 1, 'x');
+  EXPECT_EQ(db_.HSet("h", "f", big).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.HSet("h", big, "v").status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.HIncr("h", big).status().code(), StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("h"));
+}
+
+TEST_F(DbTest, HashesInABatch) {
+  Set("s", "text");
+  WriteBatch batch;
+  batch.HSet("h", "a", "1")
+      .HSet("h", {{"b", "2"}, {"c", "3"}})
+      .HDel("h", {"b"})
+      .HIncr("h", "n", 7)
+      .HIncr("h", "n")
+      .Set("t", "v");
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(*db_.HGetAll("h"), (Pairs{{"a", "1"}, {"c", "3"}, {"n", "8"}}));
+  EXPECT_EQ(db_.Keys(), (Keys{"h", "s", "t"}));
+}
+
+TEST_F(DbTest, AFailedBatchPutsAHashBackAsItWas) {
+  ASSERT_TRUE(db_.HSet("h", {{"a", "1"}, {"b", "x"}}).ok());
+  ASSERT_TRUE(*db_.Expire("h", milliseconds(100)));
+  Set("s", "text");
+  ASSERT_EQ(db_.Keys().size(), 2);  // builds the key index
+
+  WriteBatch batch;
+  batch.HSet("h", "new", "field")
+      .HDel("h", {"a"})
+      .HSet("fresh", "f", "v")  // a hash that only exists inside the batch
+      .Rename("h", "moved")
+      .HIncr("moved", "b");  // "x" is not an integer: the batch fails
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kNotInteger);
+
+  EXPECT_EQ(*db_.HGetAll("h"), (Pairs{{"a", "1"}, {"b", "x"}}));
+  EXPECT_EQ(db_.GetTtl("h").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Type("fresh"), KeyType::kNone);
+  EXPECT_EQ(db_.Type("moved"), KeyType::kNone);
+  EXPECT_EQ(db_.Keys(), (Keys{"h", "s"}));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Sweep(), 1);
+  EXPECT_EQ(db_.Keys(), Keys{"s"});
+}
+
+TEST_F(DbTest, HashKeysAreListedAmongTheKeys) {
+  ASSERT_TRUE(db_.HSet("user:1", "name", "ann").ok());
+  ASSERT_TRUE(db_.HSet("user:2", "name", "bo").ok());
+  Set("other", "v");
+  EXPECT_EQ(db_.Keys("user:"), (Keys{"user:1", "user:2"}));
+  EXPECT_EQ(db_.Keys(), (Keys{"other", "user:1", "user:2"}));
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   ASSERT_TRUE(db.Set("k", "v", milliseconds(60000)).ok());
