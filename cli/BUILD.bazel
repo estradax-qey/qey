@@ -1,0 +1,51 @@
+cc_library(
+    name = "cli_lib",
+    srcs = [
+        "cli.cc",
+        "commands.cc",
+        "result.cc",
+    ],
+    hdrs = [
+        "cli.h",
+        "commands.h",
+        "result.h",
+    ],
+    deps = [
+        "//qey:db",
+        "//qey:status",
+        "//qey:write_batch",
+    ],
+)
+
+cc_binary(
+    name = "qey",
+    srcs = ["main.cc"],
+    visibility = ["//visibility:public"],
+    deps = [":cli_lib"],
+)
+
+cc_test(
+    name = "result_test",
+    srcs = ["result_test.cc"],
+    deps = [
+        ":cli_lib",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "cli_test",
+    srcs = ["cli_test.cc"],
+    deps = [
+        ":cli_lib",
+        "//qey:db",
+        "@googletest//:gtest_main",
+    ],
+)
+
+sh_test(
+    name = "cli_smoke_test",
+    srcs = ["cli_smoke_test.sh"],
+    args = ["$(rootpath :qey)"],
+    data = [":qey"],
+)
