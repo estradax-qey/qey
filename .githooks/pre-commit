@@ -1,0 +1,39 @@
+#!/bin/sh
+# Rejects a commit if any staged C++ file is not formatted with clang-format.
+# Checks the staged content, not the working tree. Enable with:
+#   git config core.hooksPath .githooks
+set -eu
+
+find_clang_format() {
+  if command -v clang-format >/dev/null 2>&1; then
+    command -v clang-format
+  elif command -v xcrun >/dev/null 2>&1; then
+    xcrun -f clang-format 2>/dev/null
+  fi
+}
+
+clang_format=$(find_clang_format || true)
+if [ -z "$clang_format" ]; then
+  echo "pre-commit: clang-format not found; skipping the format check." >&2
+  echo "            Install it (e.g. 'brew install clang-format')." >&2
+  exit 0
+fi
+
+unformatted=""
+while IFS= read -r file; do
+  if ! git show ":$file" |
+      "$clang_format" --assume-filename="$file" --dry-run --Werror >/dev/null 2>&1; then
+    unformatted="$unformatted $file"
+  fi
+done <<LIST
+$(git diff --cached --name-only --diff-filter=ACMR -- '*.cc' '*.h')
+LIST
+
+if [ -n "$unformatted" ]; then
+  echo "pre-commit: these files are not clang-formatted:" >&2
+  for file in $unformatted; do echo "  $file" >&2; done
+  echo "Fix with:" >&2
+  echo "  $clang_format -i$unformatted" >&2
+  echo "  git add$unformatted" >&2
+  exit 1
+fi
