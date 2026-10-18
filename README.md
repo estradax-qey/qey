@@ -2,7 +2,26 @@
 
 An embedded, in-memory key-value store for C++, inspired by SQLite and Redis/Valkey.
 
-Status: early design. Nothing usable yet.
+Status: early. The core works, but the API may still change.
+
+```cpp
+#include "qey/db.h"
+
+// In memory only.
+qey::Db cache;
+
+// Durable: a single log file, replayed on open.
+auto db = qey::Db::Open("app.qey");
+if (!db.ok()) { /* db.status().message() */ }
+
+(*db)->Set("greeting", "hello", std::chrono::seconds(60));  // optional TTL
+std::optional<std::string> v = (*db)->Get("greeting");
+(*db)->Incr("visits");
+```
+
+By default every write is synced to disk before it returns. See
+[docs/design/persistence.md](docs/design/persistence.md) for the file format
+and crash behavior.
 
 ## Build
 
