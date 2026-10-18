@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -58,6 +60,16 @@ Record Coll(Type type, std::string key, std::vector<std::string> items,
   r.n2 = n2;
   return r;
 }
+Record ZAdd(std::string key, std::vector<std::string> members,
+            std::vector<double> scores, int64_t fresh = 0) {
+  Record r;
+  r.type = Type::kZAdd;
+  r.key = std::move(key);
+  r.items = std::move(members);
+  r.scores = std::move(scores);
+  r.n1 = fresh;
+  return r;
+}
 Record Replace(std::string key, std::string value) {
   return Record{Type::kReplace, std::move(key), std::move(value), {}};
 }
@@ -97,6 +109,11 @@ std::vector<Record> SampleRecords() {
       Coll(Type::kSAdd, "s", {"m1", "m2", ""}, 1),
       Coll(Type::kSAdd, "s", {"m3"}),
       Coll(Type::kSRem, "s", {"m1", "m3"}),
+      ZAdd("z", {"a", "", "b"}, {1.5, -0.25, 1e300}, 1),
+      ZAdd("z", {"c"}, {std::numeric_limits<double>::infinity()}),
+      ZAdd("z", {"d"}, {-std::numeric_limits<double>::infinity()}),
+      ZAdd("z", {"e"}, {std::numeric_limits<double>::denorm_min()}),
+      Coll(Type::kZRem, "z", {"a", "c"}),
       Replace("a", "42"),
       Replace("", ""),
       Batch({Replace("k", "1"), Set("j", "2")}),
@@ -475,6 +492,92 @@ TEST(ReplayTest, ValidChecksumWithMalformedListRecordIsCorruption) {
              Frame(std::string("\x0d", 1) + key + i64(1)) +
              Frame(std::string("\x0f", 1) + key + u32(1) + one + i64(0)) +
              Frame(std::string("\x10", 1) + key + i64(0) + i64(-1)));
+  EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
+}
+
+TEST(AppendRecordTest, RejectsInvalidSortedSetRecords) {
+  MemFile f;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (const Record& bad : {
+           ZAdd("z", {}, {}),           // nothing to add
+           ZAdd("z", {"a"}, {}),        // a member with no score
+           ZAdd("z", {"a"}, {1, 2}),    // a score with no member
+           ZAdd("z", {"a"}, {nan}),     // NaN is not a score
+           ZAdd("z", {"a"}, {1}, 2),    // bad fresh flag
+           Coll(Type::kZRem, "z", {}),  // nothing to remove
+       }) {
+    EXPECT_EQ(AppendRecord(f, bad).code(), StatusCode::kInvalidArgument);
+  }
+  Record stray = Coll(Type::kHDel, "h", {"f"});
+  stray.scores = {1.0};  // scores belong only to ZADD
+  EXPECT_EQ(AppendRecord(f, stray).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(f.Size(), 0);
+}
+
+TEST(ReplayTest, ScoresRoundTripExactly) {
+  MemFile f;
+  const std::vector<double> scores = {0.0,
+                                      -0.0,
+                                      0.1,
+                                      1.0 / 3.0,
+                                      std::numeric_limits<double>::max(),
+                                      std::numeric_limits<double>::lowest(),
+                                      std::numeric_limits<double>::min(),
+                                      std::numeric_limits<double>::denorm_min(),
+                                      std::numeric_limits<double>::infinity(),
+                                      -std::numeric_limits<double>::infinity()};
+  std::vector<std::string> members;
+  for (size_t i = 0; i < scores.size(); ++i)
+    members.push_back("m" + std::to_string(i));
+  WriteLog(f, {ZAdd("z", members, scores, 1)});
+  Replayed r = ReplayAll(f, Recovery::kStrict);
+  ASSERT_TRUE(r.result.ok());
+  ASSERT_EQ(r.records.size(), 1);
+  ASSERT_EQ(r.records[0].scores.size(), scores.size());
+  for (size_t i = 0; i < scores.size(); ++i) {
+    // Compare the bits, so that -0.0 and 0.0 are told apart.
+    EXPECT_EQ(std::memcmp(&r.records[0].scores[i], &scores[i], sizeof(double)),
+              0)
+        << i;
+  }
+}
+
+TEST(ReplayTest, ValidChecksumWithMalformedSortedSetRecordIsCorruption) {
+  auto u32 = [](uint32_t v) {
+    std::string s;
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  auto f64 = [](double v) {
+    uint64_t bits;
+    std::memcpy(&bits, &v, sizeof bits);
+    std::string s;
+    for (int i = 0; i < 8; ++i) s.push_back(static_cast<char>(bits >> (8 * i)));
+    return s;
+  };
+  const std::string key = u32(1) + "z";
+  const std::string one = u32(1) + "a";
+  const std::vector<std::string> bad_bodies = {
+      std::string("\x13", 1) + key + std::string("\x00", 1) + u32(1) +
+          one,  // no score
+      std::string("\x13", 1) + key + std::string("\x00", 1) + u32(1) + one +
+          f64(std::numeric_limits<double>::quiet_NaN()),
+      std::string("\x13", 1) + key + std::string("\x00", 1) + u32(1) + one +
+          f64(1) + f64(2),  // extra score
+      std::string("\x13", 1) + key + std::string("\x00", 1) +
+          u32(0),                             // no members
+      std::string("\x14", 1) + key + u32(0),  // remove nothing
+  };
+  for (const std::string& body : bad_bodies) {
+    MemFile f(HeaderBytes() + Frame(body));
+    Replayed r = ReplayAll(f);
+    ASSERT_FALSE(r.result.ok());
+    EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
+  }
+  MemFile ok(HeaderBytes() +
+             Frame(std::string("\x13", 1) + key + std::string("\x01", 1) +
+                   u32(1) + one + f64(2.5)) +
+             Frame(std::string("\x14", 1) + key + u32(1) + one));
   EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
 }
 

@@ -59,6 +59,9 @@ struct Record {
     // Sets.
     kSAdd = 17,  // key, n1 (fresh), items (members that were not there)
     kSRem = 18,  // key, items (members that were there)
+    // Sorted sets.
+    kZAdd = 19,  // key, n1 (fresh), items (members), scores (one for each)
+    kZRem = 20,  // key, items (members that were there)
   };
 
   Record() = default;
@@ -79,6 +82,8 @@ struct Record {
   // The strings of a collection change: fields and values, members, or
   // elements, depending on the type.
   std::vector<std::string> items;
+  // kZAdd: the score of each member in `items`, in the same order. Never NaN.
+  std::vector<double> scores;
   // Small integer arguments. Their meaning depends on the type (see above).
   int64_t n1 = 0;
   int64_t n2 = 0;

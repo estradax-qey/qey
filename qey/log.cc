@@ -1,8 +1,10 @@
 #include "qey/log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
@@ -30,6 +32,13 @@ void PutI64(std::string* out, int64_t v) {
 void PutString(std::string* out, std::string_view s) {
   PutU32(out, static_cast<uint32_t>(s.size()));
   out->append(s);
+}
+
+void PutF64(std::string* out, double v) {
+  uint64_t bits;
+  std::memcpy(&bits, &v, sizeof bits);
+  for (int i = 0; i < 8; ++i)
+    out->push_back(static_cast<char>(bits >> (8 * i)));
 }
 
 void PutStrings(std::string* out, const std::vector<std::string>& strings) {
@@ -68,6 +77,14 @@ class PayloadReader {
     if (data_.size() < n) return false;
     *out = data_.substr(0, n);
     data_.remove_prefix(n);
+    return true;
+  }
+
+  bool ReadF64(double* out) {
+    int64_t bits;
+    if (!ReadI64(&bits)) return false;
+    const uint64_t u = static_cast<uint64_t>(bits);
+    std::memcpy(out, &u, sizeof u);
     return true;
   }
 
@@ -115,6 +132,7 @@ struct Shape {
   bool strings = false;
   size_t strings_multiple = 1;  // the count must be a multiple of this...
   size_t strings_exact = 0;     // ...and, if non-zero, exactly this
+  bool scores = false;          // one score for each string follows them
   int ints = 0;                 // 0, 1 (n1) or 2 (n1 and n2)
   int64_t n1_min = 0;
   int64_t n2_min = 0;
@@ -127,6 +145,7 @@ const Shape* ShapeOf(Record::Type type) {
       .fresh = true, .strings = true, .strings_multiple = 2};
   static const Shape kFreshStrings{.fresh = true, .strings = true};
   static const Shape kStrings{.strings = true};
+  static const Shape kScored{.fresh = true, .strings = true, .scores = true};
   static const Shape kCount{.ints = 1, .n1_min = 1};
   static const Shape kIndexed{.strings = true, .strings_exact = 1, .ints = 1};
   static const Shape kRange{.ints = 2, .n2_min = -1};
@@ -135,7 +154,10 @@ const Shape* ShapeOf(Record::Type type) {
       return &kPairs;
     case T::kHDel:
     case T::kSRem:
+    case T::kZRem:
       return &kStrings;
+    case T::kZAdd:
+      return &kScored;
     case T::kLPush:
     case T::kRPush:
     case T::kSAdd:
@@ -162,6 +184,14 @@ bool FitsShape(const Shape& shape, const Record& record) {
   } else if (!record.items.empty()) {
     return false;
   }
+  if (shape.scores) {
+    if (record.scores.size() != record.items.size()) return false;
+    for (double score : record.scores) {
+      if (std::isnan(score)) return false;
+    }
+  } else if (!record.scores.empty()) {
+    return false;
+  }
   if (shape.ints >= 1 && record.n1 < shape.n1_min) return false;
   if (shape.ints >= 2 && record.n2 < shape.n2_min) return false;
   // Fields the layout does not use must be left alone.
@@ -184,7 +214,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 18) return false;
+  if (type < 1 || type > 20) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -215,6 +245,12 @@ bool DecodeBody(std::string_view body, bool nested, Record* record) {
       record->n1 = fresh;
     }
     if (shape->strings && !reader.ReadStrings(&record->items)) return false;
+    if (shape->scores) {
+      record->scores.resize(record->items.size());
+      for (double& score : record->scores) {
+        if (!reader.ReadF64(&score)) return false;
+      }
+    }
     if (shape->ints >= 1 && !reader.ReadI64(&record->n1)) return false;
     if (shape->ints >= 2 && !reader.ReadI64(&record->n2)) return false;
     return reader.done() && FitsShape(*shape, *record);
@@ -271,7 +307,7 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kSRem) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kZRem) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -306,6 +342,9 @@ Status EncodeBody(const Record& record, bool nested, std::string* body) {
     PutString(body, record.key);
     if (shape->fresh) body->push_back(static_cast<char>(record.n1));
     if (shape->strings) PutStrings(body, record.items);
+    if (shape->scores) {
+      for (double score : record.scores) PutF64(body, score);
+    }
     if (shape->ints >= 1) PutI64(body, record.n1);
     if (shape->ints >= 2) PutI64(body, record.n2);
   } else {
