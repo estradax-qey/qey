@@ -309,6 +309,16 @@ std::string Dump(Db& db, const std::string& key) {
       for (const std::string& member : *all) out += member + ",";
       return out;
     }
+    case KeyType::kZSet: {
+      std::string out = "zset:";
+      StatusOr<std::vector<ScoredMember>> all = db.ZRange(key, 0, -1);
+      for (const ScoredMember& m : *all) {
+        char score[40];
+        std::snprintf(score, sizeof score, "%.17g", m.score);
+        out += m.member + "=" + score + ",";
+      }
+      return out;
+    }
     default:
       return "?";
   }
@@ -808,6 +818,110 @@ TEST_F(PersistTest, FailedSetWritesAreUndone) {
   EXPECT_EQ(Dump(*db, "s"), "set:a,b,");
 }
 
+TEST_F(PersistTest, SortedSetsKeepExactScoresAndTtlsAcrossRestart) {
+  {
+    auto db = Open();
+    ASSERT_EQ(
+        *db->ZAdd("z",
+                  {{"a", 0.1}, {"b", 1.0 / 3.0}, {"c", -2}, {"d", 5e-324}}),
+        4);
+    ASSERT_EQ(*db->ZAdd("z", {{"a", 0.2}}), 0);
+    ASSERT_EQ(*db->ZRem("z", {"c"}), 1);
+    ASSERT_EQ(*db->ZIncr("z", "b", 1), 1.0 / 3.0 + 1);
+    ASSERT_TRUE(*db->Expire("z", seconds(100)));
+    ASSERT_EQ(*db->ZAdd("gone", {{"x", 1}}), 1);
+    ASSERT_EQ(*db->ZRem("gone", {"x"}), 1);  // empties it: key removed
+  }
+  Restart(seconds(30));
+  auto db = Open();
+  EXPECT_EQ(**db->ZScore("z", "a"), 0.2);
+  EXPECT_EQ(**db->ZScore("z", "b"), 1.0 / 3.0 + 1);
+  EXPECT_EQ(**db->ZScore("z", "d"), 5e-324);
+  EXPECT_EQ(*db->ZCard("z"), 3);
+  EXPECT_EQ(**db->ZRank("z", "d"), 0);  // the order index was rebuilt
+  EXPECT_EQ(db->GetTtl("z").remaining, seconds(70));
+  EXPECT_EQ(db->Type("gone"), KeyType::kNone);
+}
+
+TEST_F(PersistTest, ANewSortedSetDoesNotInheritAStaleExpiredEntryAfterRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->ZAdd("a", {{"old", 1}}).ok());
+    ASSERT_TRUE(*db->Expire("a", seconds(10)));
+    ASSERT_TRUE(db->SAdd("b", {"x"}).ok());
+    ASSERT_TRUE(*db->Expire("b", seconds(10)));
+    Advance(seconds(10));  // both expire, unnoticed
+
+    ASSERT_EQ(*db->ZAdd("a", {{"new", 2}}), 1);
+    ASSERT_EQ(*db->ZIncr("b", "y", 3), 3);  // was a set
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "a"), "zset:new=2,");
+  EXPECT_EQ(Dump(*db, "b"), "zset:y=3,");
+  EXPECT_EQ(db->GetTtl("a").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db->GetTtl("b").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(PersistTest, CompactionKeepsABigSortedSetInPiecesWithItsScores) {
+  std::vector<ScoredMember> members;
+  for (int i = 0; i < 30000; ++i) {
+    members.push_back(
+        {"member-" + std::to_string(100000 + i) + std::string(70, 'z'),
+         i * 0.25 - 1000});
+  }
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->ZAdd("big", members).ok());
+    ASSERT_TRUE(*db->Expire("big", seconds(500)));
+    ASSERT_TRUE(db->Compact().ok());
+  }
+  Restart(seconds(100));
+  auto db = Open();
+  EXPECT_EQ(*db->ZCard("big"), 30000);
+  EXPECT_EQ(*db->ZRange("big", 0, -1), members);  // scores rise with i
+  EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
+  EXPECT_GE(db->recovery_info().records_replayed, 4);
+}
+
+TEST_F(PersistTest, SortedSetBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->ZAdd("z", {{"a", 1}, {"b", 2}}).ok());
+    before = file_.Size();
+    WriteBatch batch;
+    batch.ZAdd("z", {{"c", 3}}).ZRem("z", {"a"}).ZIncr("y", "m", 1.5);
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  const std::string full = file_.data();
+  for (uint64_t cut = before; cut <= full.size(); ++cut) {
+    MemFile crashed(full.substr(0, cut));
+    StatusOr<std::unique_ptr<Db>> db =
+        Db::Open(std::make_unique<MemStorage>(&crashed), Options());
+    ASSERT_TRUE(db.ok()) << "cut=" << cut;
+    if (cut < full.size()) {
+      EXPECT_EQ(Dump(**db, "z"), "zset:a=1,b=2,") << "cut=" << cut;
+      EXPECT_EQ(Dump(**db, "y"), "none") << "cut=" << cut;
+    } else {
+      EXPECT_EQ(Dump(**db, "z"), "zset:b=2,c=3,");
+      EXPECT_EQ(Dump(**db, "y"), "zset:m=1.5,");
+    }
+  }
+}
+
+TEST_F(PersistTest, FailedSortedSetWritesAreUndone) {
+  auto db = Open();
+  ASSERT_TRUE(db->ZAdd("z", {{"a", 1}, {"b", 2}}).ok());
+  const uint64_t size = file_.Size();
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->ZAdd("z", {{"c", 3}}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->ZRem("z", {"a"}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->ZIncr("z", "a", 5).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_EQ(Dump(*db, "z"), "zset:a=1,b=2,");
+}
+
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
   {
     auto db = Open();
@@ -1281,7 +1395,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(16)) {
+      switch (pick(17)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -1339,6 +1453,38 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 16: {
+          const std::string m = "m" + std::to_string(pick(6));
+          const double score = pick(7) - 3;
+          switch (pick(7)) {
+            case 0:
+              ExpectSame(persistent->ZAdd(k, {{m, score}, {"m9", score * 2}}),
+                         reference.ZAdd(k, {{m, score}, {"m9", score * 2}}));
+              break;
+            case 1:
+              ExpectSame(persistent->ZRem(k, {m}), reference.ZRem(k, {m}));
+              break;
+            case 2:
+              ExpectSame(persistent->ZIncr(k, m, score / 4),
+                         reference.ZIncr(k, m, score / 4));
+              break;
+            case 3:
+              ExpectSame(persistent->ZRank(k, m), reference.ZRank(k, m));
+              break;
+            case 4:
+              ExpectSame(persistent->ZScore(k, m), reference.ZScore(k, m));
+              break;
+            case 5:
+              ExpectSame(persistent->ZRange(k, -2, 2),
+                         reference.ZRange(k, -2, 2));
+              break;
+            case 6:
+              ExpectSame(persistent->ZRangeByScore(k, -1, 1),
+                         reference.ZRangeByScore(k, -1, 1));
+              break;
+          }
+          break;
+        }
         case 15: {
           const std::string m = std::to_string(pick(6));
           switch (pick(6)) {
@@ -1443,7 +1589,17 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           const int n = 1 + pick(4);
           for (int j = 0; j < n; ++j) {
             const std::string bk = key();
-            switch (pick(16)) {
+            switch (pick(19)) {
+              case 16:
+                batch.ZAdd(bk, {{"m" + std::to_string(pick(6)),
+                                 static_cast<double>(pick(7) - 3)}});
+                break;
+              case 17:
+                batch.ZRem(bk, {"m" + std::to_string(pick(6))});
+                break;
+              case 18:
+                batch.ZIncr(bk, "m" + std::to_string(pick(6)), pick(5) - 2);
+                break;
               case 14:
                 batch.SAdd(bk, {std::to_string(pick(6))});
                 break;

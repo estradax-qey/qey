@@ -26,6 +26,14 @@ enum class KeyType {
 // A hash field and its value.
 using FieldValue = std::pair<std::string, std::string>;
 
+// A sorted-set member and its score.
+struct ScoredMember {
+  std::string member;
+  double score = 0;
+
+  bool operator==(const ScoredMember&) const = default;
+};
+
 using List = std::deque<std::string>;
 // Ordered, so that listing a hash or set is deterministic. The transparent
 // comparison lets lookups take a string_view without allocating.

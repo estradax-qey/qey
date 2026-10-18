@@ -1305,6 +1305,193 @@ TEST_F(DbTest, SetsInABatchAndARolledBackBatch) {
   EXPECT_EQ(db_.Keys(), (Keys{"s", "t", "text"}));
 }
 
+using Scored = std::vector<ScoredMember>;
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+TEST_F(DbTest, SortedSetAddCountsNewMembersAndUpdatesScores) {
+  EXPECT_EQ(*db_.ZAdd("z", {{"a", 1}, {"b", 2}, {"c", 3}}), 3);
+  EXPECT_EQ(*db_.ZAdd("z", {{"b", 20}, {"d", 4}}), 1);  // "b" only moves
+  // A repeated member counts once, with the last score.
+  EXPECT_EQ(*db_.ZAdd("z", {{"e", 1}, {"e", 5}}), 1);
+  EXPECT_EQ(**db_.ZScore("z", "b"), 20);
+  EXPECT_EQ(**db_.ZScore("z", "e"), 5);
+  EXPECT_EQ(*db_.ZCard("z"), 5);
+  EXPECT_EQ(*db_.ZAdd("z", {{"a", 1}}), 0);  // already so
+  EXPECT_EQ(*db_.ZAdd("z", Scored{}), 0);
+  EXPECT_EQ(db_.Type("z"), KeyType::kZSet);
+  EXPECT_FALSE((*db_.ZScore("z", "nope")).has_value());
+}
+
+TEST_F(DbTest, SortedSetOrdersByScoreThenMemberBytes) {
+  ASSERT_TRUE(db_.ZAdd("z", {{"b", 1},
+                             {"a", 1},
+                             {"c", -5},
+                             {"inf", kInf},
+                             {"-inf", -kInf},
+                             {"", 0},
+                             {"a2", 1}})
+                  .ok());
+  EXPECT_EQ(*db_.ZRange("z", 0, -1), (Scored{{"-inf", -kInf},
+                                             {"c", -5},
+                                             {"", 0},
+                                             {"a", 1},
+                                             {"a2", 1},
+                                             {"b", 1},
+                                             {"inf", kInf}}));
+}
+
+TEST_F(DbTest, SortedSetScoresKeepTheirExactValue) {
+  const std::vector<double> scores = {0.1, 1.0 / 3.0, 1e300, 5e-324, -0.0};
+  Scored members;
+  for (size_t i = 0; i < scores.size(); ++i) {
+    members.push_back({"m" + std::to_string(i), scores[i]});
+  }
+  ASSERT_TRUE(db_.ZAdd("z", members).ok());
+  for (size_t i = 0; i < scores.size(); ++i) {
+    EXPECT_EQ(**db_.ZScore("z", "m" + std::to_string(i)), scores[i]);
+  }
+}
+
+TEST_F(DbTest, SortedSetRankCountsFromTheLowestScore) {
+  ASSERT_TRUE(db_.ZAdd("z", {{"a", 3}, {"b", 1}, {"c", 2}}).ok());
+  EXPECT_EQ(**db_.ZRank("z", "b"), 0);
+  EXPECT_EQ(**db_.ZRank("z", "c"), 1);
+  EXPECT_EQ(**db_.ZRank("z", "a"), 2);
+  EXPECT_FALSE((*db_.ZRank("z", "nope")).has_value());
+  EXPECT_FALSE((*db_.ZRank("nope", "a")).has_value());
+  ASSERT_TRUE(db_.ZAdd("z", {{"a", 0}}).ok());  // moves to the front
+  EXPECT_EQ(**db_.ZRank("z", "a"), 0);
+  EXPECT_EQ(**db_.ZRank("z", "b"), 1);
+}
+
+TEST_F(DbTest, SortedSetRangesByPosition) {
+  ASSERT_TRUE(
+      db_.ZAdd("z", {{"a", 1}, {"b", 2}, {"c", 3}, {"d", 4}, {"e", 5}}).ok());
+  EXPECT_EQ(*db_.ZRange("z", 1, 2), (Scored{{"b", 2}, {"c", 3}}));
+  EXPECT_EQ(*db_.ZRange("z", -2, -1), (Scored{{"d", 4}, {"e", 5}}));
+  EXPECT_EQ(db_.ZRange("z", 0, -1)->size(), 5);
+  EXPECT_EQ(*db_.ZRange("z", -100, 100), *db_.ZRange("z", 0, -1));
+  EXPECT_EQ(*db_.ZRange("z", 3, 1), Scored{});
+  EXPECT_EQ(*db_.ZRange("z", 9, 12), Scored{});
+  EXPECT_EQ(*db_.ZRange("nope", 0, -1), Scored{});
+}
+
+TEST_F(DbTest, SortedSetRangesByScoreIncludeBothBounds) {
+  ASSERT_TRUE(
+      db_.ZAdd("z", {{"a", 1}, {"b", 2}, {"c", 2}, {"d", 3}, {"e", kInf}})
+          .ok());
+  EXPECT_EQ(*db_.ZRangeByScore("z", 2, 3),
+            (Scored{{"b", 2}, {"c", 2}, {"d", 3}}));
+  EXPECT_EQ(*db_.ZRangeByScore("z", 2, 2), (Scored{{"b", 2}, {"c", 2}}));
+  EXPECT_EQ(*db_.ZRangeByScore("z", -kInf, 1), (Scored{{"a", 1}}));
+  EXPECT_EQ(db_.ZRangeByScore("z", 3, kInf)->size(), 2);
+  EXPECT_EQ(*db_.ZRangeByScore("z", 5, 9), Scored{});
+  EXPECT_EQ(*db_.ZRangeByScore("z", 3, 2), Scored{});  // min above max
+  EXPECT_EQ(*db_.ZRangeByScore("nope", 0, 1), Scored{});
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(db_.ZRangeByScore("z", nan, 1).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.ZRangeByScore("z", 1, nan).status().code(),
+            StatusCode::kInvalidArgument);
+}
+
+TEST_F(DbTest, SortedSetRemoveCountsPresentMembersAndRemovesAnEmptiedKey) {
+  ASSERT_TRUE(db_.ZAdd("z", {{"a", 1}, {"b", 2}, {"c", 3}}).ok());
+  EXPECT_EQ(*db_.ZRem("z", {"a", "a", "nope"}), 1);
+  EXPECT_EQ(*db_.ZRem("z", {"nope"}), 0);
+  EXPECT_EQ(*db_.ZRem("z", Strings{}), 0);
+  EXPECT_EQ(*db_.ZCard("z"), 2);
+  EXPECT_EQ(*db_.ZRem("z", {"b", "c"}), 2);
+  EXPECT_EQ(db_.Type("z"), KeyType::kNone);
+  EXPECT_EQ(db_.Keys(), Keys{});
+  EXPECT_EQ(*db_.ZRem("nope", {"a"}), 0);
+}
+
+TEST_F(DbTest, ZIncrCreatesAddsAndRefusesAnInvalidResult) {
+  EXPECT_EQ(*db_.ZIncr("z", "a", 2.5), 2.5);  // creates the set and member
+  EXPECT_EQ(*db_.ZIncr("z", "a"), 3.5);
+  EXPECT_EQ(*db_.ZIncr("z", "b", -1), -1);
+  EXPECT_EQ(**db_.ZScore("z", "a"), 3.5);
+  EXPECT_EQ(*db_.ZIncr("z", "a", 0), 3.5);  // no change
+
+  ASSERT_TRUE(db_.ZAdd("z", {{"up", kInf}}).ok());
+  EXPECT_EQ(db_.ZIncr("z", "up", -kInf).status().code(),
+            StatusCode::kInvalidArgument);  // inf + -inf is not a number
+  EXPECT_EQ(**db_.ZScore("z", "up"), kInf);
+  EXPECT_EQ(db_.ZIncr("z", "a", std::numeric_limits<double>::quiet_NaN())
+                .status()
+                .code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(*db_.ZIncr("fresh", "m", 0), 0);  // a zero delta still creates
+  EXPECT_EQ(db_.Type("fresh"), KeyType::kZSet);
+}
+
+TEST_F(DbTest, SortedSetsRefuseNaNScores) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(db_.ZAdd("z", {{"ok", 1}, {"bad", nan}}).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("z"));
+}
+
+TEST_F(DbTest, SortedSetCommandsCheckTheTypeOfTheKey) {
+  Set("s", "string");
+  ASSERT_TRUE(db_.ZAdd("z", {{"a", 1}}).ok());
+  const StatusCode wrong = StatusCode::kWrongType;
+  EXPECT_EQ(db_.ZAdd("s", {{"a", 1}}).status().code(), wrong);
+  EXPECT_EQ(db_.ZRem("s", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.ZScore("s", "a").status().code(), wrong);
+  EXPECT_EQ(db_.ZRank("s", "a").status().code(), wrong);
+  EXPECT_EQ(db_.ZCard("s").status().code(), wrong);
+  EXPECT_EQ(db_.ZRange("s", 0, -1).status().code(), wrong);
+  EXPECT_EQ(db_.ZRangeByScore("s", 0, 1).status().code(), wrong);
+  EXPECT_EQ(db_.ZIncr("s", "a").status().code(), wrong);
+
+  ASSERT_TRUE(db_.SAdd("set", {"a"}).ok());
+  EXPECT_EQ(db_.ZAdd("set", {{"a", 1}}).status().code(), wrong);
+  EXPECT_EQ(db_.SAdd("z", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.Incr("z").status().code(), wrong);
+  EXPECT_EQ(db_.Get("z"), std::nullopt);
+  EXPECT_EQ(*db_.ZRange("z", 0, -1), (Scored{{"a", 1}}));  // untouched
+}
+
+TEST_F(DbTest, SortedSetsExpireRenameAndAreReplacedLikeAnyKey) {
+  ASSERT_TRUE(db_.ZAdd("a", {{"x", 1}, {"y", 2}}).ok());
+  ASSERT_TRUE(*db_.Expire("a", milliseconds(100)));
+  ASSERT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_EQ(*db_.ZRange("b", 0, -1), (Scored{{"x", 1}, {"y", 2}}));
+  EXPECT_EQ(db_.GetTtl("b").remaining, milliseconds(100));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Type("b"), KeyType::kNone);
+  EXPECT_EQ(*db_.ZAdd("b", {{"fresh", 9}}), 1);
+  EXPECT_EQ(*db_.ZRange("b", 0, -1), (Scored{{"fresh", 9}}));
+  EXPECT_EQ(db_.GetTtl("b").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, SortedSetsInABatchAndARolledBackBatch) {
+  ASSERT_TRUE(db_.ZAdd("z", {{"a", 1}, {"b", 2}}).ok());
+  ASSERT_TRUE(*db_.Expire("z", milliseconds(100)));
+  Set("text", "abc");
+  ASSERT_EQ(db_.Keys().size(), 2);
+
+  WriteBatch ok_batch;
+  ok_batch.ZAdd("z", {{"c", 3}, {"a", 10}})
+      .ZRem("z", {"b"})
+      .ZIncr("z", "c", 0.5);
+  ASSERT_TRUE(db_.Write(ok_batch).ok());
+  EXPECT_EQ(*db_.ZRange("z", 0, -1), (Scored{{"c", 3.5}, {"a", 10}}));
+
+  WriteBatch bad_batch;
+  bad_batch.ZAdd("z", {{"zzz", 99}})
+      .ZRem("z", {"a", "c"})
+      .ZAdd("u", {{"n", 1}})
+      .Incr("text");
+  EXPECT_EQ(db_.Write(bad_batch).code(), StatusCode::kNotInteger);
+  EXPECT_EQ(*db_.ZRange("z", 0, -1), (Scored{{"c", 3.5}, {"a", 10}}));
+  EXPECT_EQ(db_.GetTtl("z").remaining, milliseconds(100));
+  EXPECT_EQ(**db_.ZRank("z", "a"), 1);  // the order index was restored too
+  EXPECT_EQ(db_.Type("u"), KeyType::kNone);
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   ASSERT_TRUE(db.Set("k", "v", milliseconds(60000)).ok());

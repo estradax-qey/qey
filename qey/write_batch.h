@@ -145,6 +145,29 @@ class WriteBatch {
     return Add(std::move(op));
   }
 
+  // Sorted sets. The same as Db::ZAdd(), Db::ZRem() and Db::ZIncr().
+  WriteBatch& ZAdd(std::string_view key,
+                   const std::vector<ScoredMember>& members) {
+    Op op = MakeOp(Op::Type::kZAdd, key);
+    for (const ScoredMember& m : members) {
+      op.items.push_back(m.member);
+      op.scores.push_back(m.score);
+    }
+    return Add(std::move(op));
+  }
+  WriteBatch& ZRem(std::string_view key,
+                   const std::vector<std::string>& members) {
+    Op op = MakeOp(Op::Type::kZRem, key);
+    op.items = members;
+    return Add(std::move(op));
+  }
+  WriteBatch& ZIncr(std::string_view key, std::string_view member,
+                    double delta = 1) {
+    Op op = MakeOp(Op::Type::kZIncr, key, member);
+    op.d = delta;
+    return Add(std::move(op));
+  }
+
   // Removes all changes from the batch.
   void Clear() { ops_.clear(); }
 
@@ -177,6 +200,9 @@ class WriteBatch {
       kLTrim,
       kSAdd,
       kSRem,
+      kZAdd,
+      kZRem,
+      kZIncr,
     };
 
     Type type = Type::kSet;
@@ -191,6 +217,9 @@ class WriteBatch {
     // index. kLTrim: the first index to keep.
     int64_t n1 = 0;
     int64_t n2 = 0;  // kLTrim: the last index to keep.
+    // kZAdd: the score of each member in `items`. kZIncr: `d` is the delta.
+    std::vector<double> scores;
+    double d = 0;
   };
 
   static Op MakeOp(Op::Type type, std::string_view key,

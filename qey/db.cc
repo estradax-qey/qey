@@ -4,8 +4,10 @@
 #include <cassert>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -525,6 +527,115 @@ StatusOr<std::vector<std::string>> Db::CombineSets(
   return std::vector<std::string>(result.begin(), result.end());
 }
 
+StatusOr<size_t> Db::ZAdd(std::string_view key,
+                          const std::vector<ScoredMember>& members) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kZAdd, key);
+  for (const ScoredMember& m : members) {
+    op.items.push_back(m.member);
+    op.scores.push_back(m.score);
+  }
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<size_t> Db::ZRem(std::string_view key,
+                          const std::vector<std::string>& members) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kZRem, key);
+  op.items = members;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<std::optional<double>> Db::ZScore(std::string_view key,
+                                           std::string_view member) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kZSet, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return std::optional<double>();
+  const auto& scores = it->second.value.zset().scores;
+  auto m = scores.find(member);
+  if (m == scores.end()) return std::optional<double>();
+  return std::optional<double>(m->second);
+}
+
+StatusOr<std::optional<size_t>> Db::ZRank(std::string_view key,
+                                          std::string_view member) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kZSet, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return std::optional<size_t>();
+  const ZSet& zset = it->second.value.zset();
+  auto m = zset.scores.find(member);
+  if (m == zset.scores.end()) return std::optional<size_t>();
+  auto position = zset.order.find({m->second, m->first});
+  return std::optional<size_t>(
+      static_cast<size_t>(std::distance(zset.order.begin(), position)));
+}
+
+StatusOr<size_t> Db::ZCard(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kZSet, &it);
+  if (!s.ok()) return s;
+  return it == map_.end() ? size_t{0} : it->second.value.zset().size();
+}
+
+StatusOr<std::vector<ScoredMember>> Db::ZRange(std::string_view key,
+                                               int64_t start, int64_t stop) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kZSet, &it);
+  if (!s.ok()) return s;
+  std::vector<ScoredMember> out;
+  size_t first;
+  size_t last;
+  if (it == map_.end() ||
+      !ResolveRange(start, stop, it->second.value.zset().size(), &first,
+                    &last)) {
+    return out;
+  }
+  const ZSet& zset = it->second.value.zset();
+  auto position = zset.order.begin();
+  std::advance(position, static_cast<std::ptrdiff_t>(first));
+  for (size_t i = first; i <= last; ++i, ++position) {
+    out.push_back({position->second, position->first});
+  }
+  return out;
+}
+
+StatusOr<std::vector<ScoredMember>> Db::ZRangeByScore(std::string_view key,
+                                                      double min, double max) {
+  if (std::isnan(min) || std::isnan(max)) {
+    return Status(StatusCode::kInvalidArgument, "a score bound cannot be NaN");
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kZSet, &it);
+  if (!s.ok()) return s;
+  std::vector<ScoredMember> out;
+  if (it == map_.end() || min > max) return out;
+  const ZSet& zset = it->second.value.zset();
+  for (auto position = zset.order.lower_bound({min, std::string()});
+       position != zset.order.end() && position->first <= max; ++position) {
+    out.push_back({position->second, position->first});
+  }
+  return out;
+}
+
+StatusOr<double> Db::ZIncr(std::string_view key, std::string_view member,
+                           double delta) {
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kZIncr, key, member);
+  op.d = delta;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->number;
+}
+
 size_t Db::Sweep(size_t limit) {
   std::lock_guard<std::mutex> lock(mu_);
   const Clock::time_point now = now_();
@@ -592,6 +703,14 @@ Status Db::ValidateOp(const WriteBatch::Op& op) {
       return Status(StatusCode::kInvalidArgument,
                     "an element is longer than kMaxValueSize");
     }
+  }
+  for (double score : op.scores) {
+    if (std::isnan(score)) {
+      return Status(StatusCode::kInvalidArgument, "a score cannot be NaN");
+    }
+  }
+  if (std::isnan(op.d)) {
+    return Status(StatusCode::kInvalidArgument, "a delta cannot be NaN");
   }
   if (op.type == WriteBatch::Op::Type::kHSet && op.items.size() % 2 != 0) {
     return Status(StatusCode::kInvalidArgument,
@@ -858,6 +977,90 @@ Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
       }
       if (r.items.empty()) break;
       result->count = r.items.size();
+      *record = std::move(r);
+      break;
+    }
+    case Type::kZAdd: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kZSet, &it);
+      if (!s.ok()) return s;
+      const ZSet* zset = it == map_.end() ? nullptr : &it->second.value.zset();
+      // If a member is repeated, the last score is the one that counts.
+      std::map<std::string_view, double> wanted;
+      for (size_t i = 0; i < op.items.size(); ++i) {
+        wanted[op.items[i]] = op.scores[i];
+      }
+      Record r;
+      r.type = Record::Type::kZAdd;
+      r.key = op.key;
+      size_t added = 0;
+      for (const auto& [member, score] : wanted) {
+        const double* existing = nullptr;
+        if (zset != nullptr) {
+          auto found = zset->scores.find(member);
+          if (found != zset->scores.end()) existing = &found->second;
+        }
+        const bool is_new = existing == nullptr;
+        if (is_new) ++added;
+        if (is_new || *existing != score) {
+          r.items.emplace_back(member);
+          r.scores.push_back(score);
+        }
+      }
+      if (r.items.empty()) break;  // every score is already what was asked
+      result->count = added;
+      r.n1 = it == map_.end() ? 1 : 0;
+      *record = std::move(r);
+      break;
+    }
+    case Type::kZRem: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kZSet, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const ZSet& zset = it->second.value.zset();
+      std::set<std::string_view> seen;
+      Record r;
+      r.type = Record::Type::kZRem;
+      r.key = op.key;
+      for (const std::string& member : op.items) {
+        if (zset.scores.find(member) != zset.scores.end() &&
+            seen.insert(member).second) {
+          r.items.push_back(member);
+        }
+      }
+      if (r.items.empty()) break;
+      result->count = r.items.size();
+      *record = std::move(r);
+      break;
+    }
+    case Type::kZIncr: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kZSet, &it);
+      if (!s.ok()) return s;
+      double current = 0;
+      bool member_exists = false;
+      if (it != map_.end()) {
+        const ZSet& zset = it->second.value.zset();
+        auto m = zset.scores.find(op.arg);
+        if (m != zset.scores.end()) {
+          current = m->second;
+          member_exists = true;
+        }
+      }
+      const double next = current + op.d;
+      if (std::isnan(next)) {
+        return Status(StatusCode::kInvalidArgument,
+                      "the new score would not be a number");
+      }
+      result->number = next;
+      if (member_exists && next == current) break;  // nothing changes
+      Record r;
+      r.type = Record::Type::kZAdd;
+      r.key = op.key;
+      r.items = {op.arg};
+      r.scores = {next};
+      r.n1 = it == map_.end() ? 1 : 0;
       *record = std::move(r);
       break;
     }
@@ -1217,12 +1420,23 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
     }
     case KeyType::kHash:
     case KeyType::kList:
-    case KeyType::kSet: {
-      const bool is_hash = value.type() == KeyType::kHash;
+    case KeyType::kSet:
+    case KeyType::kZSet: {
       Record chunk;
-      chunk.type = is_hash                         ? Record::Type::kHSet
-                   : value.type() == KeyType::kSet ? Record::Type::kSAdd
-                                                   : Record::Type::kRPush;
+      switch (value.type()) {
+        case KeyType::kHash:
+          chunk.type = Record::Type::kHSet;
+          break;
+        case KeyType::kSet:
+          chunk.type = Record::Type::kSAdd;
+          break;
+        case KeyType::kZSet:
+          chunk.type = Record::Type::kZAdd;
+          break;
+        default:
+          chunk.type = Record::Type::kRPush;
+          break;
+      }
       chunk.key = key;
       chunk.n1 = 1;  // the first chunk starts the value; later ones add to it
       size_t bytes = 0;
@@ -1230,38 +1444,55 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
         if (chunk.items.empty()) return Status::Ok();
         Status s = emit(chunk);
         chunk.items.clear();
+        chunk.scores.clear();
         chunk.n1 = 0;
         bytes = 0;
         return s;
       };
-      // Adds one element (a hash's field and value stay together) and writes
-      // a chunk out once it is big enough.
-      auto add = [&](const std::string& a, const std::string* b) -> Status {
+      // Adds one element (a hash's field and value stay together, a member
+      // keeps its score) and writes a chunk out once it is big enough.
+      auto add = [&](const std::string& a, const std::string* b,
+                     const double* score) -> Status {
         chunk.items.push_back(a);
         bytes += a.size() + 4;
         if (b != nullptr) {
           chunk.items.push_back(*b);
           bytes += b->size() + 4;
         }
+        if (score != nullptr) {
+          chunk.scores.push_back(*score);
+          bytes += 8;
+        }
         return bytes >= kChunkBytes ? flush() : Status::Ok();
       };
-      if (is_hash) {
-        for (const auto& [field, field_value] : value.hash()) {
-          Status s = add(field, &field_value);
-          if (!s.ok()) return s;
-        }
-      } else if (value.type() == KeyType::kSet) {
-        for (const std::string& member : value.set()) {
-          Status s = add(member, nullptr);
-          if (!s.ok()) return s;
-        }
-      } else {
-        for (const std::string& element : value.list()) {
-          Status s = add(element, nullptr);
-          if (!s.ok()) return s;
-        }
+      Status s = Status::Ok();
+      switch (value.type()) {
+        case KeyType::kHash:
+          for (const auto& [field, field_value] : value.hash()) {
+            s = add(field, &field_value, nullptr);
+            if (!s.ok()) return s;
+          }
+          break;
+        case KeyType::kSet:
+          for (const std::string& member : value.set()) {
+            s = add(member, nullptr, nullptr);
+            if (!s.ok()) return s;
+          }
+          break;
+        case KeyType::kZSet:
+          for (const auto& [member, score] : value.zset().scores) {
+            s = add(member, nullptr, &score);
+            if (!s.ok()) return s;
+          }
+          break;
+        default:
+          for (const std::string& element : value.list()) {
+            s = add(element, nullptr, nullptr);
+            if (!s.ok()) return s;
+          }
+          break;
       }
-      Status s = flush();
+      s = flush();
       if (!s.ok()) return s;
       break;
     }
@@ -1425,6 +1656,30 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
       StringSet& set = it->second.value.set();
       for (const std::string& member : record.items) set.erase(member);
       if (set.empty()) EraseLocked(it);
+      break;
+    }
+    case Record::Type::kZAdd: {
+      Map::iterator it;
+      if (record.n1 == 1) {
+        it = InsertLocked(record.key);
+        ClearExpiryLocked(it);
+        it->second.value = Value::Make(KeyType::kZSet);
+      } else {
+        it = CollectionLocked(record.key, KeyType::kZSet, /*create=*/true);
+        if (it == map_.end()) break;
+      }
+      ZSet& zset = it->second.value.zset();
+      for (size_t i = 0; i < record.items.size(); ++i) {
+        zset.Set(record.items[i], record.scores[i]);
+      }
+      break;
+    }
+    case Record::Type::kZRem: {
+      auto it = CollectionLocked(record.key, KeyType::kZSet, /*create=*/false);
+      if (it == map_.end()) break;
+      ZSet& zset = it->second.value.zset();
+      for (const std::string& member : record.items) zset.Remove(member);
+      if (zset.size() == 0) EraseLocked(it);
       break;
     }
     case Record::Type::kReplace: {

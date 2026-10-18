@@ -319,6 +319,52 @@ class Db {
   StatusOr<std::vector<std::string>> SDiff(
       const std::vector<std::string>& keys);
 
+  // ---- Sorted sets ----
+  //
+  // A sorted set is a collection of distinct members, each with a score,
+  // ordered by score and then by member. Scores are doubles; infinities are
+  // allowed and NaN is not. Removing the last member removes the key. These
+  // fail with kWrongType if a key holds something other than a sorted set,
+  // and with kInvalidArgument for a NaN or an oversized key or member.
+
+  // Adds members, or changes the score of those already there; if a member
+  // is repeated the last score wins. Returns how many members are new.
+  StatusOr<size_t> ZAdd(std::string_view key,
+                        const std::vector<ScoredMember>& members);
+
+  // Removes members. Returns how many were there.
+  StatusOr<size_t> ZRem(std::string_view key,
+                        const std::vector<std::string>& members);
+
+  // The score of `member`, or std::nullopt if it is not there.
+  StatusOr<std::optional<double>> ZScore(std::string_view key,
+                                         std::string_view member);
+
+  // The position of `member` from the lowest score, counting from 0, or
+  // std::nullopt if it is not there. Takes time proportional to the position.
+  StatusOr<std::optional<size_t>> ZRank(std::string_view key,
+                                        std::string_view member);
+
+  // The number of members; 0 for a missing key.
+  StatusOr<size_t> ZCard(std::string_view key);
+
+  // The members from position `start` to `stop`, both included, in score
+  // order. Positions count from the lowest score, or from -1 at the highest
+  // when negative; out-of-range bounds are clamped as in LRange().
+  StatusOr<std::vector<ScoredMember>> ZRange(std::string_view key,
+                                             int64_t start, int64_t stop);
+
+  // The members whose score is from `min` to `max`, both included, in score
+  // order. Fails with kInvalidArgument if either is NaN.
+  StatusOr<std::vector<ScoredMember>> ZRangeByScore(std::string_view key,
+                                                    double min, double max);
+
+  // Adds `delta` to the score of `member` (a missing member or key counts as
+  // 0) and returns the new score. Fails with kInvalidArgument if `delta` is
+  // NaN or the result would be (infinity plus minus infinity).
+  StatusOr<double> ZIncr(std::string_view key, std::string_view member,
+                         double delta = 1);
+
   // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
   // byte order, starting after `after` (or from the beginning if empty).
   // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
@@ -394,6 +440,7 @@ class Db {
     bool flag = false;    // whether a key was found or something changed
     int64_t integer = 0;  // the result of an integer operation
     size_t count = 0;     // a length or a number of elements
+    double number = 0;    // the result of a floating-point operation
     std::vector<std::string> items;  // elements removed
   };
 
