@@ -1,0 +1,47 @@
+cc_library(
+    name = "measure",
+    srcs = ["process.cc"],
+    hdrs = [
+        "measure.h",
+        "process.h",
+    ],
+)
+
+cc_library(
+    name = "bench_lib",
+    srcs = [
+        "report.cc",
+        "suite.cc",
+    ],
+    hdrs = ["bench.h"],
+    deps = [
+        ":measure",
+        "//qey:db",
+        "//qey:write_batch",
+    ],
+)
+
+cc_binary(
+    name = "qey_bench",
+    srcs = ["main.cc"],
+    deps = [":bench_lib"],
+)
+
+cc_test(
+    name = "measure_test",
+    srcs = ["measure_test.cc"],
+    deps = [
+        ":measure",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "bench_test",
+    size = "large",  # builds with sanitizers are many times slower
+    srcs = ["bench_test.cc"],
+    deps = [
+        ":bench_lib",
+        "@googletest//:gtest_main",
+    ],
+)
