@@ -32,6 +32,11 @@ void PutString(std::string* out, std::string_view s) {
   out->append(s);
 }
 
+void PutStrings(std::string* out, const std::vector<std::string>& strings) {
+  PutU32(out, static_cast<uint32_t>(strings.size()));
+  for (const std::string& s : strings) PutString(out, s);
+}
+
 uint32_t GetU32(const char* p) {
   uint32_t v = 0;
   for (int i = 3; i >= 0; --i) v = (v << 8) | static_cast<uint8_t>(p[i]);
@@ -66,6 +71,27 @@ class PayloadReader {
     return true;
   }
 
+  bool ReadU8(uint8_t* out) {
+    if (data_.empty()) return false;
+    *out = static_cast<uint8_t>(data_[0]);
+    data_.remove_prefix(1);
+    return true;
+  }
+
+  // Reads a count and then that many strings.
+  bool ReadStrings(std::vector<std::string>* out) {
+    uint32_t count;
+    if (!ReadU32(&count)) return false;
+    // Every string takes at least 4 bytes, so a larger count cannot be real.
+    if (count > data_.size() / 4) return false;
+    out->reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      out->emplace_back();
+      if (!ReadString(&out->back())) return false;
+    }
+    return true;
+  }
+
   bool ReadString(std::string* out) {
     if (data_.size() < 4) return false;
     const uint32_t n = GetU32(data_.data());
@@ -96,7 +122,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 8) return false;
+  if (type < 1 || type > 10) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -119,6 +145,24 @@ bool DecodeBody(std::string_view body, bool nested, Record* record) {
   }
 
   if (!reader.ReadString(&record->key)) return false;
+
+  if (record->type == Record::Type::kHSet ||
+      record->type == Record::Type::kHDel) {
+    if (record->type == Record::Type::kHSet) {
+      uint8_t fresh;
+      if (!reader.ReadU8(&fresh) || fresh > 1) return false;
+      record->n1 = fresh;
+    }
+    if (!reader.ReadStrings(&record->items) || record->items.empty()) {
+      return false;
+    }
+    // A hash change is field/value pairs.
+    if (record->type == Record::Type::kHSet && record->items.size() % 2 != 0) {
+      return false;
+    }
+    return reader.done();
+  }
+
   if (HasValue(record->type) && !reader.ReadString(&record->value)) {
     return false;
   }
@@ -170,8 +214,7 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet ||
-      record.type > Record::Type::kReplace) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kHDel) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -199,6 +242,17 @@ Status EncodeBody(const Record& record, bool nested, std::string* body) {
       PutU32(body, static_cast<uint32_t>(sub_body.size()));
       body->append(sub_body);
     }
+  } else if (record.type == Record::Type::kHSet ||
+             record.type == Record::Type::kHDel) {
+    if (record.items.empty() || record.n1 < 0 || record.n1 > 1 ||
+        (record.type == Record::Type::kHSet && record.items.size() % 2 != 0)) {
+      return Status(StatusCode::kInvalidArgument, "invalid hash record");
+    }
+    PutString(body, record.key);
+    if (record.type == Record::Type::kHSet) {
+      body->push_back(static_cast<char>(record.n1));
+    }
+    PutStrings(body, record.items);
   } else {
     PutString(body, record.key);
     if (HasValue(record.type)) PutString(body, record.value);

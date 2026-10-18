@@ -32,6 +32,22 @@ Record Append(std::string key, std::string suffix) {
 Record Rename(std::string from, std::string to) {
   return Record{Type::kRename, std::move(from), std::move(to), {}};
 }
+Record HSet(std::string key, std::vector<std::string> items,
+            int64_t fresh = 0) {
+  Record r;
+  r.type = Type::kHSet;
+  r.key = std::move(key);
+  r.items = std::move(items);
+  r.n1 = fresh;
+  return r;
+}
+Record HDel(std::string key, std::vector<std::string> fields) {
+  Record r;
+  r.type = Type::kHDel;
+  r.key = std::move(key);
+  r.items = std::move(fields);
+  return r;
+}
 Record Replace(std::string key, std::string value) {
   return Record{Type::kReplace, std::move(key), std::move(value), {}};
 }
@@ -58,9 +74,13 @@ std::vector<Record> SampleRecords() {
       Append("", ""),
       Batch({Set("x", "1", 5), Del("y"), Rename("x", "z"), Append("z", "!")}),
       Batch({Persist("z")}),
+      HSet("h", {"f", "v", "", "", std::string("b\0n", 3), "x"}, 1),
+      HSet("h", {"g", "w"}),
+      HDel("h", {"f", "nope"}),
       Replace("a", "42"),
       Replace("", ""),
       Batch({Replace("k", "1"), Set("j", "2")}),
+      Batch({HSet("h2", {"a", "1"}, 1), HDel("h2", {"a"})}),
       Del("a"),
   };
 }
@@ -361,6 +381,55 @@ TEST(ReplayTest, ValidChecksumWithMalformedBatchIsCorruption) {
   // The well-formed version of the same shape is accepted.
   MemFile ok(HeaderBytes() +
              Frame(std::string("\x07", 1) + u32(1) + u32(6) + del_a));
+  EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
+}
+
+TEST(AppendRecordTest, RejectsInvalidHashRecords) {
+  MemFile f;
+  EXPECT_EQ(AppendRecord(f, HSet("h", {})).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(AppendRecord(f, HSet("h", {"field-without-value"})).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(AppendRecord(f, HSet("h", {"f", "v"}, 2)).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(AppendRecord(f, HDel("h", {})).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(f.Size(), 0);
+}
+
+TEST(ReplayTest, ValidChecksumWithMalformedHashRecordIsCorruption) {
+  auto u32 = [](uint32_t v) {
+    std::string s;
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  const std::string key = u32(1) + "h";
+  const std::string one = u32(1) + "a";  // the string "a"
+  const std::vector<std::string> bad_bodies = {
+      std::string("\x09", 1) + key,                           // no rest
+      std::string("\x09", 1) + key + std::string("\x00", 1),  // no items
+      std::string("\x09", 1) + key + std::string("\x02", 1) + u32(2) + one +
+          one,
+      std::string("\x09", 1) + key + std::string("\x00", 1) + u32(1) + one,
+      std::string("\x09", 1) + key + std::string("\x00", 1) + u32(0),
+      std::string("\x09", 1) + key + std::string("\x00", 1) + u32(9999) + one,
+      std::string("\x09", 1) + key + std::string("\x00", 1) + u32(2) + one +
+          one + "!",
+      std::string("\x0a", 1) + key,  // no items
+      std::string("\x0a", 1) + key + u32(0),
+      std::string("\x0a", 1) + key + u32(1) + one + "!",
+  };
+  for (const std::string& body : bad_bodies) {
+    MemFile f(HeaderBytes() + Frame(body));
+    Replayed r = ReplayAll(f);
+    ASSERT_FALSE(r.result.ok());
+    EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
+  }
+  // The well-formed forms are accepted.
+  MemFile ok(HeaderBytes() +
+             Frame(std::string("\x09", 1) + key + std::string("\x01", 1) +
+                   u32(2) + one + one) +
+             Frame(std::string("\x0a", 1) + key + u32(1) + one));
   EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
 }
 

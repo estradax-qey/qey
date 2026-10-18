@@ -41,6 +41,12 @@ struct Record {
     // without one if it is missing. For changes such as Incr() that must not
     // touch the expiry.
     kReplace = 8,
+    // Hashes. In records that create a collection, `n1` is 1 if the key did
+    // not exist when the change was made: the key then starts as an empty
+    // collection with no TTL, replacing whatever the log still holds under
+    // that name (which may be a stale entry that expired unnoticed).
+    kHSet = 9,   // key, n1 (fresh), items (field, value, field, value, ...)
+    kHDel = 10,  // key, items (the fields to remove)
   };
 
   Record() = default;
@@ -58,6 +64,11 @@ struct Record {
   // no expiry) and kExpire (required).
   std::optional<int64_t> expires_at_ms;
   std::vector<Record> records;  // kBatch only.
+  // The strings of a collection change: fields and values, members, or
+  // elements, depending on the type.
+  std::vector<std::string> items;
+  // Small integer argument. Its meaning depends on the type (see above).
+  int64_t n1 = 0;
 
   bool operator==(const Record&) const = default;
 };
