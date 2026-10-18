@@ -21,6 +21,7 @@ fi
 
 unformatted=""
 while IFS= read -r file; do
+  [ -n "$file" ] || continue
   if ! git show ":$file" |
       "$clang_format" --assume-filename="$file" --dry-run --Werror >/dev/null 2>&1; then
     unformatted="$unformatted $file"
