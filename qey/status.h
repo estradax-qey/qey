@@ -11,13 +11,17 @@ namespace qey {
 
 enum class StatusCode {
   kOk,
-  kNotInteger,  // A value could not be parsed as a 64-bit integer.
-  kOutOfRange,  // An arithmetic result does not fit in a 64-bit integer.
+  kNotInteger,       // A value could not be parsed as a 64-bit integer.
+  kOutOfRange,       // An arithmetic result does not fit in a 64-bit integer.
+  kInvalidArgument,  // The caller passed an unusable argument.
+  kIoError,          // A file system or I/O operation failed.
+  kCorruption,       // Stored data is malformed or fails its checksum.
+  kUnavailable,      // A resource is held elsewhere, e.g. a locked file.
 };
 
 // The result of an operation that can fail. A default-constructed Status is
 // OK.
-class Status {
+class [[nodiscard]] Status {
  public:
   Status() = default;
   Status(StatusCode code, std::string_view message)
@@ -36,7 +40,7 @@ class Status {
 
 // Either a value of type T or a non-OK Status explaining why there is none.
 template <typename T>
-class StatusOr {
+class [[nodiscard]] StatusOr {
  public:
   // Implicit, so functions can `return value;` or `return status;`.
   StatusOr(T value) : value_(std::move(value)) {}

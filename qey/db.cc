@@ -17,13 +17,14 @@ Db::Db() : Db(&Clock::now) {}
 
 Db::Db(NowFn now) : now_(std::move(now)) {}
 
-void Db::Set(std::string_view key, std::string_view value,
-             std::optional<std::chrono::milliseconds> ttl) {
+Status Db::Set(std::string_view key, std::string_view value,
+               std::optional<std::chrono::milliseconds> ttl) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = map_.try_emplace(std::string(key)).first;
   ClearExpiryLocked(it);
   it->second.value = std::string(value);
   if (ttl.has_value()) SetExpiryLocked(it, now_() + *ttl);
+  return Status::Ok();
 }
 
 std::optional<std::string> Db::Get(std::string_view key) {
@@ -33,7 +34,7 @@ std::optional<std::string> Db::Get(std::string_view key) {
   return it->second.value;
 }
 
-bool Db::Del(std::string_view key) {
+StatusOr<bool> Db::Del(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = FindLive(key);
   if (it == map_.end()) return false;
@@ -74,7 +75,7 @@ bool Db::Exists(std::string_view key) {
   return FindLive(key) != map_.end();
 }
 
-bool Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
+StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = FindLive(key);
   if (it == map_.end()) return false;
@@ -82,7 +83,7 @@ bool Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
   return true;
 }
 
-bool Db::Persist(std::string_view key) {
+StatusOr<bool> Db::Persist(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = FindLive(key);
   if (it == map_.end() || !it->second.expires_at.has_value()) return false;

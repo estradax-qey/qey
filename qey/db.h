@@ -20,6 +20,9 @@ namespace qey {
 
 // An in-memory key-value store. All methods are thread-safe.
 //
+// Operations that modify the store return a Status (or StatusOr) so that
+// failures can be reported. An in-memory Db never fails.
+//
 // Expired keys are removed lazily the next time they are accessed. Keys that
 // are never accessed again are reclaimed by calling Sweep(), which the owner
 // should do periodically.
@@ -52,14 +55,14 @@ class Db {
 
   // Sets `key` to `value`, replacing any existing value and TTL. If `ttl` is
   // set, the key expires after that duration; otherwise it never expires.
-  void Set(std::string_view key, std::string_view value,
-           std::optional<std::chrono::milliseconds> ttl = std::nullopt);
+  Status Set(std::string_view key, std::string_view value,
+             std::optional<std::chrono::milliseconds> ttl = std::nullopt);
 
   // Returns the value of `key`, or std::nullopt if it is missing or expired.
   std::optional<std::string> Get(std::string_view key);
 
   // Removes `key`. Returns true if a live key was removed.
-  bool Del(std::string_view key);
+  StatusOr<bool> Del(std::string_view key);
 
   // Adds `delta` to the integer stored at `key` and returns the new value. A
   // missing key is treated as 0. The key's TTL is preserved. Fails with
@@ -85,10 +88,10 @@ class Db {
 
   // Makes `key` expire after `ttl`, replacing any existing TTL. Returns true
   // if the key exists. A non-positive `ttl` expires the key immediately.
-  bool Expire(std::string_view key, std::chrono::milliseconds ttl);
+  StatusOr<bool> Expire(std::string_view key, std::chrono::milliseconds ttl);
 
   // Removes the TTL from `key`. Returns true if the key had a TTL.
-  bool Persist(std::string_view key);
+  StatusOr<bool> Persist(std::string_view key);
 
   // Reports the expiry state of `key`.
   TtlInfo GetTtl(std::string_view key);

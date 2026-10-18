@@ -21,6 +21,13 @@ TEST(StatusTest, CarriesCodeAndMessage) {
   EXPECT_EQ(s.message(), "bad");
 }
 
+TEST(StatusTest, IoCodesAreNotOk) {
+  for (StatusCode code : {StatusCode::kInvalidArgument, StatusCode::kIoError,
+                          StatusCode::kCorruption, StatusCode::kUnavailable}) {
+    EXPECT_FALSE(Status(code, "x").ok());
+  }
+}
+
 TEST(StatusOrTest, HoldsValue) {
   StatusOr<int64_t> r = 42;
   ASSERT_TRUE(r.ok());
