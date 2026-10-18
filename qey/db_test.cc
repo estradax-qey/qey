@@ -16,6 +16,7 @@ namespace qey {
 namespace {
 
 using std::chrono::milliseconds;
+using std::chrono::seconds;
 
 class DbTest : public testing::Test {
  protected:
@@ -740,6 +741,26 @@ TEST_F(DbTest, ConcurrentReadersNeverSeeAHalfAppliedBatch) {
   reader.join();
   EXPECT_EQ(torn_reads, 0);
   EXPECT_GT(reads, 0);
+}
+
+TEST_F(DbTest, IncrAndDecrNeverShortenAKeysTtl) {
+  // Steps of half a millisecond: if each Incr re-derived the expiry from a
+  // millisecond-rounded value, the TTL would shrink a little every call.
+  Set("n", "0", seconds(10));
+  Set("m", "0", seconds(10));
+  for (int i = 0; i < 100; ++i) {
+    now_ += std::chrono::microseconds(500);
+    ASSERT_TRUE(db_.Incr("n").ok());
+    ASSERT_TRUE(db_.Decr("m").ok());
+    WriteBatch batch;
+    batch.Incr("n").Decr("m");
+    ASSERT_TRUE(db_.Write(batch).ok());
+  }
+  EXPECT_EQ(db_.Get("n"), "200");
+  EXPECT_EQ(db_.Get("m"), "-200");
+  // 100 steps of 0.5 ms have passed.
+  EXPECT_EQ(db_.GetTtl("n").remaining, seconds(10) - milliseconds(50));
+  EXPECT_EQ(db_.GetTtl("m").remaining, seconds(10) - milliseconds(50));
 }
 
 TEST_F(DbTest, DefaultClockConstructs) {

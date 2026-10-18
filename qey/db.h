@@ -23,6 +23,7 @@
 #include "qey/log.h"
 #include "qey/status.h"
 #include "qey/storage.h"
+#include "qey/value.h"
 #include "qey/write_batch.h"
 
 namespace qey {
@@ -155,8 +156,12 @@ class Db {
   Status Set(std::string_view key, std::string_view value,
              std::optional<std::chrono::milliseconds> ttl = std::nullopt);
 
-  // Returns the value of `key`, or std::nullopt if it is missing or expired.
+  // Returns the value of `key`, or std::nullopt if it is missing, expired, or
+  // not a string. Use Type() to tell these apart.
   std::optional<std::string> Get(std::string_view key);
+
+  // Returns what `key` holds: KeyType::kNone if it is missing or expired.
+  KeyType Type(std::string_view key);
 
   // Removes `key`. Returns true if a live key was removed.
   StatusOr<bool> Del(std::string_view key);
@@ -164,7 +169,8 @@ class Db {
   // Appends `suffix` to the value of `key` and returns the new length. A
   // missing key is created with `suffix` as its value and no TTL; an existing
   // key keeps its TTL. Fails with kInvalidArgument, changing nothing, if the
-  // key exceeds kMaxKeySize or the result would exceed kMaxValueSize.
+  // key exceeds kMaxKeySize or the result would exceed kMaxValueSize, or with
+  // kWrongType if the key holds something other than a string.
   StatusOr<size_t> Append(std::string_view key, std::string_view suffix);
 
   // Moves the value and TTL of `from` to `to`, replacing whatever `to` held.
@@ -210,9 +216,9 @@ class Db {
 
   // Adds `delta` to the integer stored at `key` and returns the new value. A
   // missing key is treated as 0. The key's TTL is preserved. Fails with
-  // kNotInteger if the stored value is not a base-10 64-bit integer, or
-  // kOutOfRange if the result overflows; the stored value is unchanged on
-  // failure.
+  // kNotInteger if the stored value is not a base-10 64-bit integer,
+  // kOutOfRange if the result overflows, or kWrongType if the key holds
+  // something other than a string; the stored value is unchanged on failure.
   StatusOr<int64_t> Incr(std::string_view key, int64_t delta = 1);
 
   // Like Incr(), but subtracts `delta`.
@@ -261,8 +267,17 @@ class Db {
 
  private:
   struct Entry {
-    std::string value;
+    Value value;
     std::optional<Clock::time_point> expires_at;
+
+    Entry Clone() const { return Entry{value.Clone(), expires_at}; }
+  };
+
+  // What a change reports back to the call that made it.
+  struct OpResult {
+    bool flag = false;    // whether a key was found or something changed
+    int64_t integer = 0;  // the result of an integer operation
+    size_t count = 0;     // a length or a number of elements
   };
 
   // Transparent hashing lets lookups take a string_view without allocating.
@@ -351,15 +366,27 @@ class Db {
   // that the batch can be undone. A nullopt value means the key did not exist.
   using Undo = std::map<std::string, std::optional<Entry>, std::less<>>;
 
-  // Applies one change of a batch to memory, adds the record that describes
-  // it (or none, if it changes nothing) to `effective`, and notes what it
-  // overwrote in `undo`. Fails without side effects beyond `undo`. Requires
-  // `mu_` held.
-  Status StageLocked(const WriteBatch::Op& op, Undo* undo,
-                     std::vector<Record>* effective, const ClockPoint& ref);
+  static WriteBatch::Op MakeOp(WriteBatch::Op::Type type, std::string_view key,
+                               std::string_view arg = "");
+
+  // Checks what can be checked about `op` without looking at the data.
+  static Status ValidateOp(const WriteBatch::Op& op);
+
+  // Works out what `op` does against the current contents: sets `*record` to
+  // the record that describes the change (left empty if it changes nothing)
+  // and `*result` to what the call reports. Reads only. Requires `mu_` held.
+  Status PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
+                    std::optional<Record>* record, OpResult* result);
+
+  // Validates, plans, logs and applies one change. Every single-key mutation
+  // goes through this.
+  StatusOr<OpResult> Run(const WriteBatch::Op& op);
+
+  // Notes the current state of `key` in `undo` unless it is already there.
+  void RememberLocked(Undo* undo, std::string_view key);
 
   // Puts back everything recorded in `undo`. Requires `mu_` held.
-  void RollbackLocked(const Undo& undo);
+  void RollbackLocked(Undo&& undo);
 
   // Builds `keys_` from `map_` if it is not built yet. Requires `mu_` held.
   void EnsureKeyIndexLocked();
@@ -367,10 +394,6 @@ class Db {
   // Moves the entry at `it` to the key `to`, replacing any entry there, and
   // keeps its expiry. `to` must differ from the entry's key. Requires `mu_`.
   void RenameLocked(Map::iterator it, std::string_view to);
-
-  // Implements Incr() and Decr(). Requires `mu_` held.
-  StatusOr<int64_t> AddLocked(std::string_view key, int64_t delta,
-                              bool subtract);
 
   NowFn now_;
   WallNowFn wall_now_;

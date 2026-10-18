@@ -63,6 +63,8 @@ class WriteBatch {
  private:
   friend class Db;
 
+  // One change. Db builds these for its single-key calls as well, so that a
+  // call and the same change inside a batch share one implementation.
   struct Op {
     enum class Type {
       kSet,
@@ -75,17 +77,23 @@ class WriteBatch {
       kDecr,
     };
 
-    Type type;
+    Type type = Type::kSet;
     std::string key;
     // The value for kSet, the suffix for kAppend, the new key for kRename.
     std::string arg;
     std::optional<std::chrono::milliseconds> ttl;  // kSet, kExpire.
-    int64_t delta;                                 // kIncr, kDecr.
+    int64_t n1 = 0;                                // kIncr, kDecr: the delta.
   };
 
   WriteBatch& Add(Op::Type type, std::string_view key, std::string_view arg,
-                  std::optional<std::chrono::milliseconds> ttl, int64_t delta) {
-    ops_.push_back(Op{type, std::string(key), std::string(arg), ttl, delta});
+                  std::optional<std::chrono::milliseconds> ttl, int64_t n1) {
+    Op op;
+    op.type = type;
+    op.key = std::string(key);
+    op.arg = std::string(arg);
+    op.ttl = ttl;
+    op.n1 = n1;
+    ops_.push_back(std::move(op));
     return *this;
   }
 

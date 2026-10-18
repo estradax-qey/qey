@@ -17,6 +17,7 @@ enum class StatusCode {
   kIoError,          // A file system or I/O operation failed.
   kCorruption,       // Stored data is malformed or fails its checksum.
   kUnavailable,      // A resource is held elsewhere, e.g. a locked file.
+  kWrongType,        // The key holds a different type of value.
 };
 
 // The result of an operation that can fail. A default-constructed Status is

@@ -57,6 +57,11 @@ StatusOr<int64_t> Added(const std::string* current_value, int64_t delta,
   return result;
 }
 
+Status WrongType() {
+  return Status(StatusCode::kWrongType,
+                "the key holds a different type of value");
+}
+
 Status CheckKey(std::string_view key) {
   if (key.size() > Db::kMaxKeySize) {
     return Status(StatusCode::kInvalidArgument,
@@ -167,7 +172,8 @@ Status Db::Recover(Recovery recovery) {
   // A log much bigger than the data in it is compacted right away.
   uint64_t live_bytes = kLogHeaderSize;
   for (const auto& [key, entry] : map_) {
-    live_bytes += 8 + 1 + 4 + key.size() + 4 + entry.value.size() + 8;
+    live_bytes +=
+        8 + 1 + 4 + key.size() + 4 + entry.value.ApproxEncodedBytes() + 8;
   }
   SetCompactThreshold(live_bytes);
   MaybeCompactLocked();
@@ -176,69 +182,46 @@ Status Db::Recover(Recovery recovery) {
 
 Status Db::Set(std::string_view key, std::string_view value,
                std::optional<std::chrono::milliseconds> ttl) {
-  if (ttl.has_value()) {
-    Status valid = CheckTtl(*ttl);
-    if (!valid.ok()) return valid;
-  }
-  Status valid_key = CheckKey(key);
-  if (!valid_key.ok()) return valid_key;
-  if (value.size() > kMaxValueSize) {
-    return Status(StatusCode::kInvalidArgument,
-                  "value is longer than kMaxValueSize");
-  }
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  const ClockPoint ref = ReadClocks();
-  std::optional<Clock::time_point> expires_at;
-  if (ttl.has_value()) expires_at = ref.steady + ClampTtl(*ttl);
-
-  Record record{Record::Type::kSet, std::string(key), std::string(value),
-                std::nullopt};
-  if (expires_at.has_value()) {
-    record.expires_at_ms = ToWallMs(*expires_at, ref);
-  }
-  Status s = LogLocked(record);
-  if (!s.ok()) return s;
-
-  auto it = InsertLocked(key);
-  ClearExpiryLocked(it);
-  it->second.value = std::string(value);
-  if (expires_at.has_value()) SetExpiryLocked(it, *expires_at);
-  return Status::Ok();
+  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kSet, key, value);
+  op.ttl = ttl;
+  return Run(op).status();
 }
 
 std::optional<std::string> Db::Get(std::string_view key) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = FindLive(key);
-  if (it == map_.end()) return std::nullopt;
-  return it->second.value;
+  if (it == map_.end() || it->second.value.type() != KeyType::kString) {
+    return std::nullopt;
+  }
+  return it->second.value.str();
+}
+
+KeyType Db::Type(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = FindLive(key);
+  return it == map_.end() ? KeyType::kNone : it->second.value.type();
 }
 
 StatusOr<bool> Db::Del(std::string_view key) {
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  auto it = FindLive(key);
-  if (it == map_.end()) return false;
-  Status s = LogLocked(Record{Record::Type::kDel, std::string(key), "", {}});
-  if (!s.ok()) return s;
-  EraseLocked(it);
-  return true;
+  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kDel, key));
+  if (!r.ok()) return r.status();
+  return r->flag;
 }
 
 StatusOr<int64_t> Db::Incr(std::string_view key, int64_t delta) {
-  Status valid = CheckKey(key);
-  if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  return AddLocked(key, delta, /*subtract=*/false);
+  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kIncr, key);
+  op.n1 = delta;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->integer;
 }
 
 StatusOr<int64_t> Db::Decr(std::string_view key, int64_t delta) {
-  Status valid = CheckKey(key);
-  if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  return AddLocked(key, delta, /*subtract=*/true);
+  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kDecr, key);
+  op.n1 = delta;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->integer;
 }
 
 size_t Db::Sweep(size_t limit) {
@@ -265,76 +248,155 @@ bool Db::Exists(std::string_view key) {
 }
 
 StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
-  Status valid = CheckTtl(ttl);
-  if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  auto it = FindLive(key);
-  if (it == map_.end()) return false;
-  const ClockPoint ref = ReadClocks();
-  const Clock::time_point at = ref.steady + ClampTtl(ttl);
-  Status s = LogLocked(
-      Record{Record::Type::kExpire, std::string(key), "", ToWallMs(at, ref)});
-  if (!s.ok()) return s;
-  SetExpiryLocked(it, at);
-  return true;
+  WriteBatch::Op op = MakeOp(WriteBatch::Op::Type::kExpire, key);
+  op.ttl = ttl;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->flag;
 }
 
 StatusOr<bool> Db::Persist(std::string_view key) {
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  auto it = FindLive(key);
-  if (it == map_.end() || !it->second.expires_at.has_value()) return false;
-  Status s =
-      LogLocked(Record{Record::Type::kPersist, std::string(key), "", {}});
-  if (!s.ok()) return s;
-  ClearExpiryLocked(it);
-  return true;
+  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kPersist, key));
+  if (!r.ok()) return r.status();
+  return r->flag;
 }
 
 StatusOr<size_t> Db::Append(std::string_view key, std::string_view suffix) {
-  Status valid = CheckKey(key);
-  if (!valid.ok()) return valid;
-  std::lock_guard<std::mutex> lock(mu_);
-  MaybeCompactLocked();
-  auto it = FindLive(key);
-  const size_t old_size = it == map_.end() ? 0 : it->second.value.size();
-  if (suffix.size() > kMaxValueSize ||
-      old_size > kMaxValueSize - suffix.size()) {
-    return Status(StatusCode::kInvalidArgument,
-                  "value would be longer than kMaxValueSize");
-  }
-
-  if (it == map_.end()) {
-    // A new key is logged as a plain SET: replay must not depend on whether
-    // an earlier, expired value is still around.
-    Status s = LogLocked(Record{Record::Type::kSet, std::string(key),
-                                std::string(suffix), std::nullopt});
-    if (!s.ok()) return s;
-    InsertLocked(key)->second.value = suffix;
-  } else {
-    Status s = LogLocked(Record{Record::Type::kAppend, std::string(key),
-                                std::string(suffix), std::nullopt});
-    if (!s.ok()) return s;
-    it->second.value.append(suffix);
-  }
-  return old_size + suffix.size();
+  StatusOr<OpResult> r =
+      Run(MakeOp(WriteBatch::Op::Type::kAppend, key, suffix));
+  if (!r.ok()) return r.status();
+  return r->count;
 }
 
 StatusOr<bool> Db::Rename(std::string_view from, std::string_view to) {
-  Status valid = CheckKey(to);
+  StatusOr<OpResult> r = Run(MakeOp(WriteBatch::Op::Type::kRename, from, to));
+  if (!r.ok()) return r.status();
+  return r->flag;
+}
+
+WriteBatch::Op Db::MakeOp(WriteBatch::Op::Type type, std::string_view key,
+                          std::string_view arg) {
+  WriteBatch::Op op;
+  op.type = type;
+  op.key = std::string(key);
+  op.arg = std::string(arg);
+  return op;
+}
+
+Status Db::ValidateOp(const WriteBatch::Op& op) {
+  Status valid = CheckKey(op.key);
   if (!valid.ok()) return valid;
+  if (op.type == WriteBatch::Op::Type::kRename) {
+    valid = CheckKey(op.arg);
+    if (!valid.ok()) return valid;
+  } else if (op.arg.size() > kMaxValueSize) {
+    return Status(StatusCode::kInvalidArgument,
+                  "value is longer than kMaxValueSize");
+  }
+  if (op.ttl.has_value()) return CheckTtl(*op.ttl);
+  return Status::Ok();
+}
+
+StatusOr<Db::OpResult> Db::Run(const WriteBatch::Op& op) {
+  Status valid = ValidateOp(op);
+  if (!valid.ok()) return valid;
+
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
-  auto it = FindLive(from);
-  if (it == map_.end()) return false;
-  if (from == to) return true;
-
-  Status s = LogLocked(
-      Record{Record::Type::kRename, std::string(from), std::string(to), {}});
+  const ClockPoint ref = ReadClocks();
+  std::optional<Record> record;
+  OpResult result;
+  Status s = PlanLocked(op, ref, &record, &result);
   if (!s.ok()) return s;
-  RenameLocked(it, to);
-  return true;
+  if (!record.has_value()) return result;  // it changes nothing
+
+  // Log first, so a failed write leaves memory as it was; then apply through
+  // the same code that replays the log.
+  s = LogLocked(*record);
+  if (!s.ok()) return s;
+  ApplyRecordLocked(std::move(*record), ref);
+  return result;
+}
+
+Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
+                      std::optional<Record>* record, OpResult* result) {
+  using Type = WriteBatch::Op::Type;
+  switch (op.type) {
+    case Type::kSet: {
+      Record r{Record::Type::kSet, op.key, op.arg, std::nullopt};
+      if (op.ttl.has_value()) {
+        r.expires_at_ms = ToWallMs(ref.steady + ClampTtl(*op.ttl), ref);
+      }
+      *record = std::move(r);
+      break;
+    }
+    case Type::kDel: {
+      if (FindLive(op.key) == map_.end()) break;
+      result->flag = true;
+      *record = Record{Record::Type::kDel, op.key, "", {}};
+      break;
+    }
+    case Type::kExpire: {
+      if (FindLive(op.key) == map_.end()) break;
+      result->flag = true;
+      *record = Record{Record::Type::kExpire, op.key, "",
+                       ToWallMs(ref.steady + ClampTtl(*op.ttl), ref)};
+      break;
+    }
+    case Type::kPersist: {
+      auto it = FindLive(op.key);
+      if (it == map_.end() || !it->second.expires_at.has_value()) break;
+      result->flag = true;
+      *record = Record{Record::Type::kPersist, op.key, "", {}};
+      break;
+    }
+    case Type::kAppend: {
+      auto it = FindLive(op.key);
+      size_t old_size = 0;
+      if (it != map_.end()) {
+        if (it->second.value.type() != KeyType::kString) return WrongType();
+        old_size = it->second.value.str().size();
+      }
+      if (old_size > kMaxValueSize - op.arg.size()) {
+        return Status(StatusCode::kInvalidArgument,
+                      "value would be longer than kMaxValueSize");
+      }
+      result->count = old_size + op.arg.size();
+      // A new key is a plain SET: replay must not depend on whether an
+      // earlier, expired value is still around.
+      *record =
+          Record{it == map_.end() ? Record::Type::kSet : Record::Type::kAppend,
+                 op.key, op.arg, std::nullopt};
+      break;
+    }
+    case Type::kRename: {
+      if (FindLive(op.key) == map_.end()) break;
+      result->flag = true;
+      if (op.key == op.arg) break;
+      FindLive(op.arg);  // drops an expired destination
+      *record = Record{Record::Type::kRename, op.key, op.arg, {}};
+      break;
+    }
+    case Type::kIncr:
+    case Type::kDecr: {
+      auto it = FindLive(op.key);
+      const std::string* current = nullptr;
+      if (it != map_.end()) {
+        if (it->second.value.type() != KeyType::kString) return WrongType();
+        current = &it->second.value.str();
+      }
+      StatusOr<int64_t> added = Added(current, op.n1, op.type == Type::kDecr);
+      if (!added.ok()) return added.status();
+      result->integer = *added;
+      // The resulting value, never the delta, so replay does no arithmetic.
+      // A live key is REPLACEd so that its TTL is left exactly as it is.
+      *record =
+          Record{it == map_.end() ? Record::Type::kSet : Record::Type::kReplace,
+                 op.key, std::to_string(*added), std::nullopt};
+      break;
+    }
+  }
+  return Status::Ok();
 }
 
 Status Db::Write(const WriteBatch& batch) {
@@ -342,16 +404,7 @@ Status Db::Write(const WriteBatch& batch) {
   // Everything that can be checked without looking at the data comes first,
   // so that a bad batch is refused before anything is touched.
   for (const WriteBatch::Op& op : batch.ops_) {
-    Status valid = CheckKey(op.key);
-    if (valid.ok() && op.type == WriteBatch::Op::Type::kRename) {
-      valid = CheckKey(op.arg);
-    }
-    if (valid.ok() && op.ttl.has_value()) valid = CheckTtl(*op.ttl);
-    if (valid.ok() && op.arg.size() > kMaxValueSize &&
-        op.type != WriteBatch::Op::Type::kRename) {
-      valid = Status(StatusCode::kInvalidArgument,
-                     "value is longer than kMaxValueSize");
-    }
+    Status valid = ValidateOp(op);
     if (!valid.ok()) return valid;
   }
 
@@ -369,11 +422,24 @@ Status Db::Write(const WriteBatch& batch) {
   std::vector<Record> effective;
   const ClockPoint ref = ReadClocks();  // one instant for the whole batch
   for (const WriteBatch::Op& op : batch.ops_) {
-    Status s = StageLocked(op, &undo, &effective, ref);
+    std::optional<Record> record;
+    OpResult unused;
+    Status s = PlanLocked(op, ref, &record, &unused);
     if (!s.ok()) {
-      RollbackLocked(undo);
+      RollbackLocked(std::move(undo));
       return s;
     }
+    if (!record.has_value()) continue;
+
+    RememberLocked(&undo, record->key);
+    if (record->type == Record::Type::kRename) {
+      RememberLocked(&undo, record->value);
+    }
+    // Applied through the same code as replay, so a live batch and a
+    // recovered one cannot differ.
+    Record copy = *record;
+    ApplyRecordLocked(std::move(copy), ref);
+    effective.push_back(std::move(*record));
   }
   if (effective.empty()) return Status::Ok();  // every change was a no-op
 
@@ -386,105 +452,22 @@ Status Db::Write(const WriteBatch& batch) {
   }
   Status s = LogLocked(record);
   if (!s.ok()) {
-    RollbackLocked(undo);
+    RollbackLocked(std::move(undo));
     return s;
   }
   return Status::Ok();
 }
 
-Status Db::StageLocked(const WriteBatch::Op& op, Undo* undo,
-                       std::vector<Record>* effective, const ClockPoint& ref) {
-  using Type = WriteBatch::Op::Type;
-
-  auto remember = [&](std::string_view key) {
-    if (undo->find(key) != undo->end()) return;
-    auto it = map_.find(key);
-    undo->emplace(std::string(key), it == map_.end()
-                                        ? std::nullopt
-                                        : std::optional<Entry>(it->second));
-  };
-  // Applies through the same code as replay, so a live batch and a recovered
-  // one cannot differ.
-  auto apply = [&](Record record) {
-    Record copy = record;
-    ApplyRecordLocked(std::move(copy), ref);
-    effective->push_back(std::move(record));
-  };
-
-  switch (op.type) {
-    case Type::kSet: {
-      remember(op.key);
-      Record record{Record::Type::kSet, op.key, op.arg, std::nullopt};
-      if (op.ttl.has_value()) {
-        record.expires_at_ms = ToWallMs(ref.steady + ClampTtl(*op.ttl), ref);
-      }
-      apply(std::move(record));
-      break;
-    }
-    case Type::kDel: {
-      if (FindLive(op.key) == map_.end()) break;
-      remember(op.key);
-      apply(Record{Record::Type::kDel, op.key, "", {}});
-      break;
-    }
-    case Type::kExpire: {
-      if (FindLive(op.key) == map_.end()) break;
-      remember(op.key);
-      apply(Record{Record::Type::kExpire, op.key, "",
-                   ToWallMs(ref.steady + ClampTtl(*op.ttl), ref)});
-      break;
-    }
-    case Type::kPersist: {
-      auto it = FindLive(op.key);
-      if (it == map_.end() || !it->second.expires_at.has_value()) break;
-      remember(op.key);
-      apply(Record{Record::Type::kPersist, op.key, "", {}});
-      break;
-    }
-    case Type::kAppend: {
-      auto it = FindLive(op.key);
-      const size_t old_size = it == map_.end() ? 0 : it->second.value.size();
-      if (old_size > kMaxValueSize - op.arg.size()) {
-        return Status(StatusCode::kInvalidArgument,
-                      "value would be longer than kMaxValueSize");
-      }
-      remember(op.key);
-      // A new key is a plain SET, as in Append().
-      apply(
-          Record{it == map_.end() ? Record::Type::kSet : Record::Type::kAppend,
-                 op.key, op.arg, std::nullopt});
-      break;
-    }
-    case Type::kRename: {
-      if (FindLive(op.key) == map_.end() || op.key == op.arg) break;
-      FindLive(op.arg);  // drops an expired destination
-      remember(op.key);
-      remember(op.arg);
-      apply(Record{Record::Type::kRename, op.key, op.arg, {}});
-      break;
-    }
-    case Type::kIncr:
-    case Type::kDecr: {
-      auto it = FindLive(op.key);
-      StatusOr<int64_t> added =
-          Added(it == map_.end() ? nullptr : &it->second.value, op.delta,
-                op.type == Type::kDecr);
-      if (!added.ok()) return added.status();
-      Record record{Record::Type::kSet, op.key, std::to_string(*added),
-                    std::nullopt};
-      if (it != map_.end() && it->second.expires_at.has_value()) {
-        record.expires_at_ms = ToWallMs(*it->second.expires_at, ref);
-      }
-      remember(op.key);
-      apply(std::move(record));
-      break;
-    }
-  }
-  return Status::Ok();
+void Db::RememberLocked(Undo* undo, std::string_view key) {
+  if (undo->find(key) != undo->end()) return;
+  auto it = map_.find(key);
+  undo->emplace(std::string(key),
+                it == map_.end() ? std::nullopt
+                                 : std::optional<Entry>(it->second.Clone()));
 }
 
-void Db::RollbackLocked(const Undo& undo) {
-  for (const auto& [key, original] : undo) {
+void Db::RollbackLocked(Undo&& undo) {
+  for (auto& [key, original] : undo) {
     auto it = map_.find(key);
     if (!original.has_value()) {
       if (it != map_.end()) EraseLocked(it);
@@ -492,7 +475,7 @@ void Db::RollbackLocked(const Undo& undo) {
     }
     if (it == map_.end()) it = InsertLocked(key);
     ClearExpiryLocked(it);
-    it->second.value = original->value;
+    it->second.value = std::move(original->value);
     if (original->expires_at.has_value()) {
       SetExpiryLocked(it, *original->expires_at);
     }
@@ -506,10 +489,10 @@ std::vector<std::optional<std::string>> Db::MGet(
   values.reserve(keys.size());
   for (const std::string& key : keys) {
     auto it = FindLive(key);
-    if (it == map_.end()) {
+    if (it == map_.end() || it->second.value.type() != KeyType::kString) {
       values.emplace_back(std::nullopt);
     } else {
-      values.emplace_back(it->second.value);
+      values.emplace_back(it->second.value.str());
     }
   }
   return values;
@@ -622,31 +605,6 @@ Db::TtlInfo Db::GetTtl(std::string_view key) {
                                                                 now_())};
 }
 
-StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
-                                bool subtract) {
-  auto it = FindLive(key);
-  StatusOr<int64_t> added =
-      Added(it == map_.end() ? nullptr : &it->second.value, delta, subtract);
-  if (!added.ok()) return added.status();
-  const int64_t result = *added;
-
-  std::string text = std::to_string(result);
-  // Log the resulting value, not the delta, so replay never redoes arithmetic.
-  Record record{Record::Type::kSet, std::string(key), text, std::nullopt};
-  if (it != map_.end() && it->second.expires_at.has_value()) {
-    record.expires_at_ms = ToWallMs(*it->second.expires_at, ReadClocks());
-  }
-  Status s = LogLocked(record);
-  if (!s.ok()) return s;
-
-  if (it != map_.end()) {
-    it->second.value = std::move(text);
-  } else {
-    InsertLocked(key)->second.value = std::move(text);
-  }
-  return result;
-}
-
 Status Db::LogLocked(const Record& record) {
   if (storage_ == nullptr) return Status::Ok();
   Status healthy = CheckHealthyLocked();
@@ -710,7 +668,8 @@ Status Db::CompactLocked(bool empty) {
     for (const auto& [key, entry] : map_) {
       if (empty) break;
       if (entry.expires_at.has_value() && *entry.expires_at <= now) continue;
-      Record record{Record::Type::kSet, key, entry.value, std::nullopt};
+      assert(entry.value.type() == KeyType::kString);
+      Record record{Record::Type::kSet, key, entry.value.str(), std::nullopt};
       if (entry.expires_at.has_value()) {
         record.expires_at_ms = ToWallMs(*entry.expires_at, ref);
       }
@@ -742,7 +701,7 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
     case Record::Type::kSet: {
       auto it = InsertLocked(record.key);
       ClearExpiryLocked(it);
-      it->second.value = std::move(record.value);
+      it->second.value = Value(std::move(record.value));
       if (record.expires_at_ms.has_value()) {
         SetExpiryLocked(it, FromWallMs(*record.expires_at_ms, ref));
       }
@@ -769,7 +728,14 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
       // The key was live when this was logged, so it exists unless the log
       // was edited; tolerate that by creating it.
       auto it = InsertLocked(record.key);
-      it->second.value.append(record.value);
+      if (it->second.value.type() == KeyType::kString) {
+        it->second.value.str().append(record.value);
+      }
+      break;
+    }
+    case Record::Type::kReplace: {
+      auto it = InsertLocked(record.key);  // the TTL, if any, is kept
+      it->second.value = Value(std::move(record.value));
       break;
     }
     case Record::Type::kRename: {

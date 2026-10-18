@@ -14,6 +14,22 @@ cc_test(
 )
 
 cc_library(
+    name = "value",
+    srcs = ["value.cc"],
+    hdrs = ["value.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "value_test",
+    srcs = ["value_test.cc"],
+    deps = [
+        ":value",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "write_batch",
     hdrs = ["write_batch.h"],
     visibility = ["//visibility:public"],
@@ -29,6 +45,7 @@ cc_library(
         ":posix_storage",
         ":status",
         ":storage",
+        ":value",
         ":write_batch",
     ],
     visibility = ["//visibility:public"],

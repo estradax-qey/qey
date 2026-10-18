@@ -513,6 +513,24 @@ TEST_F(PersistTest, ExpirePersistAndOverwriteSurviveReopen) {
   EXPECT_FALSE(db->Exists("now"));
 }
 
+TEST_F(PersistTest, IncrNeverShortensTheTtlEvenAcrossManyCallsAndReopens) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("n", "0", seconds(100)).ok());
+    for (int i = 0; i < 50; ++i) {
+      steady_ += std::chrono::microseconds(500);
+      wall_ += std::chrono::microseconds(500);
+      ASSERT_TRUE(db->Incr("n").ok());
+    }
+    EXPECT_EQ(db->GetTtl("n").remaining, seconds(100) - milliseconds(25));
+  }
+  // The log carries the absolute deadline from the Set, untouched by the Incrs.
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(db->Get("n"), "50");
+  EXPECT_EQ(db->GetTtl("n").remaining, seconds(100) - milliseconds(25));
+}
+
 TEST_F(PersistTest, IncrKeepsTtlAcrossReopen) {
   {
     auto db = Open();
