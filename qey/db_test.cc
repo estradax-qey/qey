@@ -972,6 +972,201 @@ TEST_F(DbTest, HashKeysAreListedAmongTheKeys) {
   EXPECT_EQ(db_.Keys(), (Keys{"other", "user:1", "user:2"}));
 }
 
+using Strings = std::vector<std::string>;
+
+TEST_F(DbTest, ListPushesGoToTheHeadOneAtATimeOrTheTailInOrder) {
+  EXPECT_EQ(*db_.RPush("l", {"a", "b", "c"}), 3);
+  EXPECT_EQ(*db_.LPush("l", {"x", "y"}), 5);  // y ends up first
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"y", "x", "a", "b", "c"}));
+  EXPECT_EQ(*db_.LLen("l"), 5);
+  EXPECT_EQ(db_.Type("l"), KeyType::kList);
+  EXPECT_EQ(*db_.RPush("l", Strings{}), 5);  // nothing to push
+  EXPECT_EQ(*db_.LPush("fresh", Strings{}), 0);
+  EXPECT_FALSE(db_.Exists("fresh"));
+}
+
+TEST_F(DbTest, ListElementsMayBeEmptyAndHoldAnyBytes) {
+  ASSERT_TRUE(db_.RPush("l", {"", std::string("\0x", 2), "z"}).ok());
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"", std::string("\0x", 2), "z"}));
+  EXPECT_EQ(**db_.LIndex("l", 0), "");
+}
+
+TEST_F(DbTest, ListIndexingCountsFromEitherEnd) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c"}).ok());
+  EXPECT_EQ(**db_.LIndex("l", 0), "a");
+  EXPECT_EQ(**db_.LIndex("l", 2), "c");
+  EXPECT_EQ(**db_.LIndex("l", -1), "c");
+  EXPECT_EQ(**db_.LIndex("l", -3), "a");
+  EXPECT_FALSE((*db_.LIndex("l", 3)).has_value());
+  EXPECT_FALSE((*db_.LIndex("l", -4)).has_value());
+  EXPECT_FALSE(
+      (*db_.LIndex("l", std::numeric_limits<int64_t>::min())).has_value());
+  EXPECT_FALSE(
+      (*db_.LIndex("l", std::numeric_limits<int64_t>::max())).has_value());
+  EXPECT_FALSE((*db_.LIndex("nope", 0)).has_value());
+}
+
+TEST_F(DbTest, ListRangesAreInclusiveAndClamped) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c", "d", "e"}).ok());
+  EXPECT_EQ(*db_.LRange("l", 1, 3), (Strings{"b", "c", "d"}));
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"a", "b", "c", "d", "e"}));
+  EXPECT_EQ(*db_.LRange("l", -2, -1), (Strings{"d", "e"}));
+  EXPECT_EQ(*db_.LRange("l", -100, 100), (Strings{"a", "b", "c", "d", "e"}));
+  EXPECT_EQ(*db_.LRange("l", 3, 1), Strings{});
+  EXPECT_EQ(*db_.LRange("l", 5, 9), Strings{});
+  EXPECT_EQ(*db_.LRange("l", -100, -50), Strings{});
+  EXPECT_EQ(*db_.LRange("l", 2, 2), Strings{"c"});
+  EXPECT_EQ(*db_.LRange("l", std::numeric_limits<int64_t>::min(),
+                        std::numeric_limits<int64_t>::max()),
+            (Strings{"a", "b", "c", "d", "e"}));
+  EXPECT_EQ(*db_.LRange("nope", 0, -1), Strings{});
+}
+
+TEST_F(DbTest, PoppingReturnsElementsInTheOrderTheyLeave) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c", "d", "e"}).ok());
+  EXPECT_EQ(*db_.LPop("l"), Strings{"a"});
+  EXPECT_EQ(*db_.RPop("l"), Strings{"e"});
+  EXPECT_EQ(*db_.LPop("l", 2), (Strings{"b", "c"}));
+  EXPECT_EQ(*db_.LRange("l", 0, -1), Strings{"d"});
+  EXPECT_EQ(*db_.LPop("l", 0), Strings{});
+  EXPECT_EQ(*db_.RPop("nope"), Strings{});
+  EXPECT_EQ(*db_.LLen("l"), 1);
+}
+
+TEST_F(DbTest, PoppingMoreThanThereIsEmptiesTheListAndRemovesTheKey) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c"}).ok());
+  EXPECT_EQ(*db_.RPop("l", 100), (Strings{"c", "b", "a"}));
+  EXPECT_EQ(db_.Type("l"), KeyType::kNone);
+  EXPECT_FALSE(db_.Exists("l"));
+  EXPECT_EQ(db_.Keys(), Keys{});
+  EXPECT_EQ(*db_.LPop("l", std::numeric_limits<size_t>::max()), Strings{});
+}
+
+TEST_F(DbTest, LSetReplacesAnElementOrReportsFalse) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c"}).ok());
+  EXPECT_TRUE(*db_.LSet("l", 1, "B"));
+  EXPECT_TRUE(*db_.LSet("l", -1, "C"));
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"a", "B", "C"}));
+  EXPECT_FALSE(*db_.LSet("l", 3, "x"));
+  EXPECT_FALSE(*db_.LSet("l", -4, "x"));
+  EXPECT_FALSE(*db_.LSet("nope", 0, "x"));
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"a", "B", "C"}));
+}
+
+TEST_F(DbTest, LTrimKeepsARange) {
+  auto fill = [&] {
+    ASSERT_TRUE(db_.Del("l").ok());
+    ASSERT_TRUE(db_.RPush("l", {"a", "b", "c", "d", "e"}).ok());
+  };
+  fill();
+  ASSERT_TRUE(db_.LTrim("l", 1, 3).ok());
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"b", "c", "d"}));
+  fill();
+  ASSERT_TRUE(db_.LTrim("l", -2, -1).ok());
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"d", "e"}));
+  fill();
+  ASSERT_TRUE(db_.LTrim("l", 0, -1).ok());  // keeps everything
+  EXPECT_EQ(*db_.LLen("l"), 5);
+  ASSERT_TRUE(db_.LTrim("l", -100, 100).ok());
+  EXPECT_EQ(*db_.LLen("l"), 5);
+  ASSERT_TRUE(db_.LTrim("l", 2, 2).ok());
+  EXPECT_EQ(*db_.LRange("l", 0, -1), Strings{"c"});
+  ASSERT_TRUE(db_.LTrim("nope", 0, 1).ok());  // not an error
+}
+
+TEST_F(DbTest, LTrimKeepingNothingRemovesTheKey) {
+  for (auto [start, stop] :
+       {std::pair<int64_t, int64_t>{3, 1}, {5, 9}, {-100, -50}}) {
+    ASSERT_TRUE(db_.RPush("l", {"a", "b", "c"}).ok());
+    ASSERT_TRUE(db_.LTrim("l", start, stop).ok());
+    EXPECT_EQ(db_.Type("l"), KeyType::kNone) << start << " " << stop;
+  }
+}
+
+TEST_F(DbTest, ListCommandsCheckTheTypeOfTheKey) {
+  Set("s", "string");
+  ASSERT_TRUE(db_.RPush("l", {"a"}).ok());
+  const StatusCode wrong = StatusCode::kWrongType;
+  EXPECT_EQ(db_.LPush("s", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.RPush("s", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.LPop("s").status().code(), wrong);
+  EXPECT_EQ(db_.RPop("s").status().code(), wrong);
+  EXPECT_EQ(db_.LLen("s").status().code(), wrong);
+  EXPECT_EQ(db_.LIndex("s", 0).status().code(), wrong);
+  EXPECT_EQ(db_.LRange("s", 0, -1).status().code(), wrong);
+  EXPECT_EQ(db_.LSet("s", 0, "x").status().code(), wrong);
+  EXPECT_EQ(db_.LTrim("s", 0, 1).code(), wrong);
+  EXPECT_EQ(db_.Get("s"), "string");
+
+  ASSERT_TRUE(db_.HSet("h", "f", "v").ok());
+  EXPECT_EQ(db_.LPush("h", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.HSet("l", "f", "v").status().code(), wrong);
+  EXPECT_EQ(db_.Append("l", "x").status().code(), wrong);
+  EXPECT_EQ(db_.Incr("l").status().code(), wrong);
+  EXPECT_EQ(db_.Get("l"), std::nullopt);
+  EXPECT_EQ(*db_.LRange("l", 0, -1), Strings{"a"});  // untouched
+}
+
+TEST_F(DbTest, ListsExpireRenameAndAreReplacedLikeAnyKey) {
+  ASSERT_TRUE(db_.RPush("a", {"x", "y"}).ok());
+  ASSERT_TRUE(*db_.Expire("a", milliseconds(100)));
+  ASSERT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_EQ(*db_.LRange("b", 0, -1), (Strings{"x", "y"}));
+  EXPECT_EQ(db_.GetTtl("b").remaining, milliseconds(100));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Type("b"), KeyType::kNone);
+  EXPECT_EQ(*db_.RPush("b", {"fresh"}), 1);  // not "x", "y", "fresh"
+  EXPECT_EQ(db_.GetTtl("b").state, Db::TtlState::kNoExpiry);
+
+  Set("b", "now a string");
+  EXPECT_EQ(db_.Type("b"), KeyType::kString);
+}
+
+TEST_F(DbTest, OversizedListElementsAreRejected) {
+  std::string big(Db::kMaxValueSize + 1, 'x');
+  EXPECT_EQ(db_.RPush("l", {"ok", big}).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.LSet("l", 0, big).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("l"));
+}
+
+TEST_F(DbTest, ListsInABatch) {
+  WriteBatch batch;
+  batch.RPush("l", {"a", "b", "c", "d"})
+      .LPush("l", {"z"})
+      .LPop("l")
+      .RPop("l", 2)
+      .LSet("l", 0, "A")
+      .RPush("q", {"1", "2", "3"})
+      .LTrim("q", 1, -1);
+  ASSERT_TRUE(db_.Write(batch).ok());
+  // [a b c d] -> [z a b c d] -> [a b c d] -> [a b] -> [A b]
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"A", "b"}));
+  EXPECT_EQ(*db_.LRange("q", 0, -1), (Strings{"2", "3"}));
+}
+
+TEST_F(DbTest, AFailedBatchPutsAListBackAsItWas) {
+  ASSERT_TRUE(db_.RPush("l", {"a", "b", "c"}).ok());
+  ASSERT_TRUE(*db_.Expire("l", milliseconds(100)));
+  Set("text", "abc");
+  ASSERT_EQ(db_.Keys().size(), 2);  // builds the key index
+
+  WriteBatch batch;
+  batch.LPush("l", {"x"})
+      .RPop("l", 2)
+      .LTrim("l", 0, 0)
+      .RPush("fresh", {"n"})
+      .LPop("fresh")  // empties and removes a list created in this batch
+      .Incr("text");  // fails
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kNotInteger);
+
+  EXPECT_EQ(*db_.LRange("l", 0, -1), (Strings{"a", "b", "c"}));
+  EXPECT_EQ(db_.GetTtl("l").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Type("fresh"), KeyType::kNone);
+  EXPECT_EQ(db_.Keys(), (Keys{"l", "text"}));
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   ASSERT_TRUE(db.Set("k", "v", milliseconds(60000)).ok());

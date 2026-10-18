@@ -57,6 +57,31 @@ StatusOr<int64_t> Added(const std::string* current_value, int64_t delta,
   return result;
 }
 
+// Resolves a possibly negative list index against a list of `size` elements.
+// Returns false if it falls outside the list.
+bool ResolveIndex(int64_t index, size_t size, size_t* resolved) {
+  const int64_t n = static_cast<int64_t>(size);
+  if (index < 0) index += n;
+  if (index < 0 || index >= n) return false;
+  *resolved = static_cast<size_t>(index);
+  return true;
+}
+
+// Resolves an inclusive range with possibly negative ends against a list of
+// `size` elements, clamping to what exists. Returns false if the range holds
+// no elements.
+bool ResolveRange(int64_t start, int64_t stop, size_t size, size_t* first,
+                  size_t* last) {
+  const int64_t n = static_cast<int64_t>(size);
+  if (start < 0) start = std::max<int64_t>(n + start, 0);
+  if (stop < 0) stop = n + stop;
+  if (stop >= n) stop = n - 1;
+  if (start > stop || start >= n) return false;
+  *first = static_cast<size_t>(start);
+  *last = static_cast<size_t>(stop);
+  return true;
+}
+
 Status WrongType() {
   return Status(StatusCode::kWrongType,
                 "the key holds a different type of value");
@@ -309,6 +334,101 @@ StatusOr<int64_t> Db::HIncr(std::string_view key, std::string_view field,
   return r->integer;
 }
 
+StatusOr<size_t> Db::LPush(std::string_view key,
+                           const std::vector<std::string>& values) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kLPush, key);
+  op.items = values;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<size_t> Db::RPush(std::string_view key,
+                           const std::vector<std::string>& values) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kRPush, key);
+  op.items = values;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<std::vector<std::string>> Db::LPop(std::string_view key,
+                                            size_t count) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kLPop, key);
+  op.n1 = static_cast<int64_t>(std::min<size_t>(count, INT64_MAX));
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return std::move(r->items);
+}
+
+StatusOr<std::vector<std::string>> Db::RPop(std::string_view key,
+                                            size_t count) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kRPop, key);
+  op.n1 = static_cast<int64_t>(std::min<size_t>(count, INT64_MAX));
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return std::move(r->items);
+}
+
+StatusOr<size_t> Db::LLen(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kList, &it);
+  if (!s.ok()) return s;
+  return it == map_.end() ? size_t{0} : it->second.value.list().size();
+}
+
+StatusOr<std::optional<std::string>> Db::LIndex(std::string_view key,
+                                                int64_t index) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kList, &it);
+  if (!s.ok()) return s;
+  size_t resolved;
+  if (it == map_.end() ||
+      !ResolveIndex(index, it->second.value.list().size(), &resolved)) {
+    return std::optional<std::string>();
+  }
+  return std::optional<std::string>(it->second.value.list()[resolved]);
+}
+
+StatusOr<std::vector<std::string>> Db::LRange(std::string_view key,
+                                              int64_t start, int64_t stop) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kList, &it);
+  if (!s.ok()) return s;
+  std::vector<std::string> out;
+  size_t first;
+  size_t last;
+  if (it == map_.end() ||
+      !ResolveRange(start, stop, it->second.value.list().size(), &first,
+                    &last)) {
+    return out;
+  }
+  const List& list = it->second.value.list();
+  out.assign(list.begin() + static_cast<std::ptrdiff_t>(first),
+             list.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+  return out;
+}
+
+StatusOr<bool> Db::LSet(std::string_view key, int64_t index,
+                        std::string_view value) {
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kLSet, key, value);
+  op.n1 = index;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->flag;
+}
+
+Status Db::LTrim(std::string_view key, int64_t start, int64_t stop) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kLTrim, key);
+  op.n1 = start;
+  op.n2 = stop;
+  return Run(op).status();
+}
+
 size_t Db::Sweep(size_t limit) {
   std::lock_guard<std::mutex> lock(mu_);
   const Clock::time_point now = now_();
@@ -521,6 +641,85 @@ Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
       }
       if (r.items.empty()) break;
       result->count = r.items.size();
+      *record = std::move(r);
+      break;
+    }
+    case Type::kLPush:
+    case Type::kRPush: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kList, &it);
+      if (!s.ok()) return s;
+      const size_t old_size =
+          it == map_.end() ? 0 : it->second.value.list().size();
+      result->count = old_size + op.items.size();
+      if (op.items.empty()) break;
+      Record r;
+      r.type =
+          op.type == Type::kLPush ? Record::Type::kLPush : Record::Type::kRPush;
+      r.key = op.key;
+      r.items = op.items;
+      r.n1 = it == map_.end() ? 1 : 0;
+      *record = std::move(r);
+      break;
+    }
+    case Type::kLPop:
+    case Type::kRPop: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kList, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const List& list = it->second.value.list();
+      const size_t n = static_cast<size_t>(std::min<int64_t>(
+          std::max<int64_t>(op.n1, 0), static_cast<int64_t>(list.size())));
+      if (n == 0) break;
+      for (size_t i = 0; i < n; ++i) {
+        result->items.push_back(
+            op.type == Type::kLPop ? list[i] : list[list.size() - 1 - i]);
+      }
+      result->count = n;
+      Record r;
+      r.type =
+          op.type == Type::kLPop ? Record::Type::kLPop : Record::Type::kRPop;
+      r.key = op.key;
+      r.n1 = static_cast<int64_t>(n);
+      *record = std::move(r);
+      break;
+    }
+    case Type::kLSet: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kList, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      size_t index;
+      if (!ResolveIndex(op.n1, it->second.value.list().size(), &index)) break;
+      result->flag = true;
+      Record r;
+      r.type = Record::Type::kLSet;
+      r.key = op.key;
+      r.items = {op.arg};
+      r.n1 = static_cast<int64_t>(index);
+      *record = std::move(r);
+      break;
+    }
+    case Type::kLTrim: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kList, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const size_t size = it->second.value.list().size();
+      size_t first = 0;
+      size_t last = 0;
+      Record r;
+      r.type = Record::Type::kLTrim;
+      r.key = op.key;
+      if (ResolveRange(op.n1, op.n2, size, &first, &last)) {
+        if (first == 0 && last == size - 1) break;  // keeps everything
+        r.n1 = static_cast<int64_t>(first);
+        r.n2 = static_cast<int64_t>(last);
+      } else {
+        r.n1 = 0;  // keeps nothing
+        r.n2 = -1;
+      }
       *record = std::move(r);
       break;
     }
@@ -878,11 +1077,13 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
       }
       return emit(record);
     }
-    case KeyType::kHash: {
+    case KeyType::kHash:
+    case KeyType::kList: {
+      const bool is_hash = value.type() == KeyType::kHash;
       Record chunk;
-      chunk.type = Record::Type::kHSet;
+      chunk.type = is_hash ? Record::Type::kHSet : Record::Type::kRPush;
       chunk.key = key;
-      chunk.n1 = 1;  // the first chunk starts the hash; later ones add to it
+      chunk.n1 = 1;  // the first chunk starts the value; later ones add to it
       size_t bytes = 0;
       auto flush = [&]() -> Status {
         if (chunk.items.empty()) return Status::Ok();
@@ -892,12 +1093,25 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
         bytes = 0;
         return s;
       };
-      for (const auto& [field, field_value] : value.hash()) {
-        chunk.items.push_back(field);
-        chunk.items.push_back(field_value);
-        bytes += field.size() + field_value.size() + 8;
-        if (bytes >= kChunkBytes) {
-          Status s = flush();
+      // Adds one element (a hash's field and value stay together) and writes
+      // a chunk out once it is big enough.
+      auto add = [&](const std::string& a, const std::string* b) -> Status {
+        chunk.items.push_back(a);
+        bytes += a.size() + 4;
+        if (b != nullptr) {
+          chunk.items.push_back(*b);
+          bytes += b->size() + 4;
+        }
+        return bytes >= kChunkBytes ? flush() : Status::Ok();
+      };
+      if (is_hash) {
+        for (const auto& [field, field_value] : value.hash()) {
+          Status s = add(field, &field_value);
+          if (!s.ok()) return s;
+        }
+      } else {
+        for (const std::string& element : value.list()) {
+          Status s = add(element, nullptr);
           if (!s.ok()) return s;
         }
       }
@@ -981,6 +1195,68 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
       Hash& hash = it->second.value.hash();
       for (const std::string& field : record.items) hash.erase(field);
       if (hash.empty()) EraseLocked(it);
+      break;
+    }
+    case Record::Type::kLPush:
+    case Record::Type::kRPush: {
+      Map::iterator it;
+      if (record.n1 == 1) {
+        it = InsertLocked(record.key);
+        ClearExpiryLocked(it);
+        it->second.value = Value::Make(KeyType::kList);
+      } else {
+        it = CollectionLocked(record.key, KeyType::kList, /*create=*/true);
+        if (it == map_.end()) break;
+      }
+      List& list = it->second.value.list();
+      for (std::string& item : record.items) {
+        if (record.type == Record::Type::kLPush) {
+          list.push_front(std::move(item));
+        } else {
+          list.push_back(std::move(item));
+        }
+      }
+      break;
+    }
+    case Record::Type::kLPop:
+    case Record::Type::kRPop: {
+      auto it = CollectionLocked(record.key, KeyType::kList, /*create=*/false);
+      if (it == map_.end()) break;
+      List& list = it->second.value.list();
+      for (int64_t i = 0; i < record.n1 && !list.empty(); ++i) {
+        if (record.type == Record::Type::kLPop) {
+          list.pop_front();
+        } else {
+          list.pop_back();
+        }
+      }
+      if (list.empty()) EraseLocked(it);
+      break;
+    }
+    case Record::Type::kLSet: {
+      auto it = CollectionLocked(record.key, KeyType::kList, /*create=*/false);
+      if (it == map_.end()) break;
+      List& list = it->second.value.list();
+      if (static_cast<size_t>(record.n1) < list.size()) {
+        list[static_cast<size_t>(record.n1)] = std::move(record.items[0]);
+      }
+      break;
+    }
+    case Record::Type::kLTrim: {
+      auto it = CollectionLocked(record.key, KeyType::kList, /*create=*/false);
+      if (it == map_.end()) break;
+      List& list = it->second.value.list();
+      if (record.n2 < record.n1 ||
+          static_cast<size_t>(record.n1) >= list.size()) {
+        EraseLocked(it);
+        break;
+      }
+      const size_t last =
+          std::min<size_t>(static_cast<size_t>(record.n2), list.size() - 1);
+      list.erase(list.begin() + static_cast<std::ptrdiff_t>(last) + 1,
+                 list.end());
+      list.erase(list.begin(),
+                 list.begin() + static_cast<std::ptrdiff_t>(record.n1));
       break;
     }
     case Record::Type::kReplace: {

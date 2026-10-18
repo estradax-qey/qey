@@ -297,6 +297,12 @@ std::string Dump(Db& db, const std::string& key) {
       for (const auto& [field, value] : *all) out += field + "=" + value + ";";
       return out;
     }
+    case KeyType::kList: {
+      std::string out = "list:";
+      StatusOr<std::vector<std::string>> all = db.LRange(key, 0, -1);
+      for (const std::string& element : *all) out += element + ",";
+      return out;
+    }
     default:
       return "?";
   }
@@ -592,6 +598,115 @@ TEST_F(PersistTest, FailedHashWritesAreUndone) {
   EXPECT_EQ(db->HIncr("h", "n").status().code(), StatusCode::kIoError);
   EXPECT_EQ(file_.Size(), size);
   EXPECT_EQ(Dump(*db, "h"), "hash:a=1;");
+}
+
+TEST_F(PersistTest, ListsAndTheirTtlsSurviveRestart) {
+  {
+    auto db = Open();
+    ASSERT_EQ(*db->RPush("l", {"c", "d", "e"}), 3);
+    ASSERT_EQ(*db->LPush("l", {"b", "a"}), 5);  // a b c d e
+    ASSERT_EQ(*db->RPop("l"), std::vector<std::string>{"e"});
+    ASSERT_TRUE(*db->LSet("l", -1, "D"));
+    ASSERT_TRUE(*db->Expire("l", seconds(100)));
+    ASSERT_EQ(*db->RPush("gone", {"x"}), 1);
+    ASSERT_EQ(db->LPop("gone")->size(), 1);  // empties the list: key removed
+    ASSERT_EQ(*db->RPush("trim", {"1", "2", "3", "4", "5"}), 5);
+    ASSERT_TRUE(db->LTrim("trim", 1, -2).ok());
+    ASSERT_EQ(*db->RPush("none", {"1", "2"}), 2);
+    ASSERT_TRUE(db->LTrim("none", 5, 9).ok());  // keeps nothing
+  }
+  Restart(seconds(30));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "l"), "list:a,b,c,D,");
+  EXPECT_EQ(db->GetTtl("l").remaining, seconds(70));
+  EXPECT_EQ(Dump(*db, "trim"), "list:2,3,4,");
+  EXPECT_EQ(db->Type("gone"), KeyType::kNone);
+  EXPECT_EQ(db->Type("none"), KeyType::kNone);
+}
+
+TEST_F(PersistTest, ANewListDoesNotInheritAStaleExpiredEntryAfterRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->RPush("l", {"old1", "old2"}).ok());
+    ASSERT_TRUE(*db->Expire("l", seconds(10)));
+    ASSERT_TRUE(db->Set("s", "string", seconds(10)).ok());
+    ASSERT_TRUE(db->HSet("h", "f", "v").ok());
+    ASSERT_TRUE(*db->Expire("h", seconds(10)));
+    Advance(seconds(10));  // all three expire, unnoticed
+
+    ASSERT_EQ(*db->RPush("l", {"new"}), 1);
+    ASSERT_EQ(*db->LPush("s", {"a", "b"}), 2);
+    ASSERT_EQ(*db->RPush("h", {"x"}), 1);
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "l"), "list:new,");
+  EXPECT_EQ(Dump(*db, "s"), "list:b,a,");
+  EXPECT_EQ(Dump(*db, "h"), "list:x,");
+  for (const char* k : {"l", "s", "h"}) {
+    EXPECT_EQ(db->GetTtl(k).state, Db::TtlState::kNoExpiry) << k;
+  }
+}
+
+TEST_F(PersistTest, CompactionKeepsABigListInOrderAndInPieces) {
+  std::vector<std::string> elements;
+  for (int i = 0; i < 40000; ++i) {
+    elements.push_back(std::to_string(1000000 + i) + std::string(80, 'x'));
+  }
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->RPush("big", elements).ok());
+    ASSERT_TRUE(*db->Expire("big", seconds(500)));
+    ASSERT_TRUE(db->Compact().ok());
+  }
+  Restart(seconds(100));
+  auto db = Open();
+  EXPECT_EQ(*db->LLen("big"), 40000);
+  EXPECT_EQ(*db->LRange("big", 0, -1), elements);
+  EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
+  EXPECT_GE(db->recovery_info().records_replayed, 4);  // pieces, plus the TTL
+}
+
+TEST_F(PersistTest, ListBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->RPush("l", {"a", "b", "c"}).ok());
+    before = file_.Size();
+    WriteBatch batch;
+    batch.LPush("l", {"z"})
+        .RPop("l", 2)
+        .RPush("q", {"1", "2"})
+        .LSet("q", 0, "X");
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  const std::string full = file_.data();
+  for (uint64_t cut = before; cut <= full.size(); ++cut) {
+    MemFile crashed(full.substr(0, cut));
+    StatusOr<std::unique_ptr<Db>> db =
+        Db::Open(std::make_unique<MemStorage>(&crashed), Options());
+    ASSERT_TRUE(db.ok()) << "cut=" << cut;
+    if (cut < full.size()) {
+      EXPECT_EQ(Dump(**db, "l"), "list:a,b,c,") << "cut=" << cut;
+      EXPECT_EQ(Dump(**db, "q"), "none") << "cut=" << cut;
+    } else {
+      EXPECT_EQ(Dump(**db, "l"), "list:z,a,");
+      EXPECT_EQ(Dump(**db, "q"), "list:X,2,");
+    }
+  }
+}
+
+TEST_F(PersistTest, FailedListWritesAreUndone) {
+  auto db = Open();
+  ASSERT_TRUE(db->RPush("l", {"a", "b"}).ok());
+  const uint64_t size = file_.Size();
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->LPush("l", {"x"}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->RPop("l").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->LSet("l", 0, "x").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->LTrim("l", 0, 0).code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_EQ(Dump(*db, "l"), "list:a,b,");
 }
 
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
@@ -1067,7 +1182,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(14)) {
+      switch (pick(15)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -1125,6 +1240,50 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 14: {
+          const std::string v = std::to_string(pick(50));
+          switch (pick(8)) {
+            case 0:
+              ExpectSame(persistent->LPush(k, {v, v + "x"}),
+                         reference.LPush(k, {v, v + "x"}));
+              break;
+            case 1:
+              ExpectSame(persistent->RPush(k, {v}), reference.RPush(k, {v}));
+              break;
+            case 2: {
+              const size_t n = pick(3);
+              ExpectSame(persistent->LPop(k, n), reference.LPop(k, n));
+              break;
+            }
+            case 3: {
+              const size_t n = pick(3);
+              ExpectSame(persistent->RPop(k, n), reference.RPop(k, n));
+              break;
+            }
+            case 4: {
+              const int64_t i = pick(7) - 3;
+              ExpectSame(persistent->LSet(k, i, v), reference.LSet(k, i, v));
+              break;
+            }
+            case 5: {
+              const int64_t a = pick(9) - 4;
+              const int64_t b = pick(9) - 4;
+              EXPECT_EQ(persistent->LTrim(k, a, b).code(),
+                        reference.LTrim(k, a, b).code());
+              break;
+            }
+            case 6: {
+              const int64_t i = pick(7) - 3;
+              ExpectSame(persistent->LIndex(k, i), reference.LIndex(k, i));
+              break;
+            }
+            case 7:
+              ExpectSame(persistent->LRange(k, -3, 3),
+                         reference.LRange(k, -3, 3));
+              break;
+          }
+          break;
+        }
         case 13: {
           const std::string field = "f" + std::to_string(pick(4));
           switch (pick(3)) {
@@ -1152,7 +1311,20 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           const int n = 1 + pick(4);
           for (int j = 0; j < n; ++j) {
             const std::string bk = key();
-            switch (pick(11)) {
+            switch (pick(14)) {
+              case 11:
+                batch.RPush(bk, {std::to_string(pick(50))});
+                break;
+              case 12:
+                if (pick(2) == 0) {
+                  batch.LPop(bk, pick(3));
+                } else {
+                  batch.RPop(bk, pick(3));
+                }
+                break;
+              case 13:
+                batch.LTrim(bk, pick(5) - 2, pick(5) - 2);
+                break;
               case 8:
                 batch.HSet(bk, "f" + std::to_string(pick(4)),
                            std::to_string(pick(50)));

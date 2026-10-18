@@ -240,6 +240,51 @@ class Db {
   StatusOr<int64_t> HIncr(std::string_view key, std::string_view field,
                           int64_t delta = 1);
 
+  // ---- Lists ----
+  //
+  // A list is a sequence of strings. Indexes count from 0 at the head, or
+  // from -1 at the tail when negative. Removing the last element removes the
+  // key. These fail with kWrongType if the key holds something other than a
+  // list, and with kInvalidArgument if a key or element exceeds its size
+  // limit.
+
+  // Adds `values` to the head, one at a time, so the last of them ends up
+  // first. Returns the new length.
+  StatusOr<size_t> LPush(std::string_view key,
+                         const std::vector<std::string>& values);
+
+  // Adds `values` to the tail, in order. Returns the new length.
+  StatusOr<size_t> RPush(std::string_view key,
+                         const std::vector<std::string>& values);
+
+  // Removes and returns up to `count` elements from the head (or the tail),
+  // in the order they were removed. Empty for a missing key.
+  StatusOr<std::vector<std::string>> LPop(std::string_view key,
+                                          size_t count = 1);
+  StatusOr<std::vector<std::string>> RPop(std::string_view key,
+                                          size_t count = 1);
+
+  // The number of elements; 0 for a missing key.
+  StatusOr<size_t> LLen(std::string_view key);
+
+  // The element at `index`, or std::nullopt if there is none.
+  StatusOr<std::optional<std::string>> LIndex(std::string_view key,
+                                              int64_t index);
+
+  // The elements from `start` to `stop`, both included. Out-of-range bounds
+  // are clamped, so the result may be empty.
+  StatusOr<std::vector<std::string>> LRange(std::string_view key, int64_t start,
+                                            int64_t stop);
+
+  // Replaces the element at `index`. Returns false, changing nothing, if the
+  // key is missing or `index` is out of range.
+  StatusOr<bool> LSet(std::string_view key, int64_t index,
+                      std::string_view value);
+
+  // Keeps only the elements from `start` to `stop`, both included, as in
+  // LRange(). Keeping none removes the key. A missing key is not an error.
+  Status LTrim(std::string_view key, int64_t start, int64_t stop);
+
   // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
   // byte order, starting after `after` (or from the beginning if empty).
   // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
@@ -315,6 +360,7 @@ class Db {
     bool flag = false;    // whether a key was found or something changed
     int64_t integer = 0;  // the result of an integer operation
     size_t count = 0;     // a length or a number of elements
+    std::vector<std::string> items;  // elements removed
   };
 
   // Transparent hashing lets lookups take a string_view without allocating.

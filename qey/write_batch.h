@@ -1,6 +1,7 @@
 #ifndef QEY_WRITE_BATCH_H_
 #define QEY_WRITE_BATCH_H_
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +93,44 @@ class WriteBatch {
     return Add(std::move(op));
   }
 
+  // Lists. The same as Db::LPush(), Db::RPush(), Db::LPop(), Db::RPop(),
+  // Db::LSet() and Db::LTrim(). (A pop inside a batch discards what it
+  // removes.)
+  WriteBatch& LPush(std::string_view key,
+                    const std::vector<std::string>& values) {
+    Op op = MakeOp(Op::Type::kLPush, key);
+    op.items = values;
+    return Add(std::move(op));
+  }
+  WriteBatch& RPush(std::string_view key,
+                    const std::vector<std::string>& values) {
+    Op op = MakeOp(Op::Type::kRPush, key);
+    op.items = values;
+    return Add(std::move(op));
+  }
+  WriteBatch& LPop(std::string_view key, size_t count = 1) {
+    Op op = MakeOp(Op::Type::kLPop, key);
+    op.n1 = static_cast<int64_t>(std::min<size_t>(count, INT64_MAX));
+    return Add(std::move(op));
+  }
+  WriteBatch& RPop(std::string_view key, size_t count = 1) {
+    Op op = MakeOp(Op::Type::kRPop, key);
+    op.n1 = static_cast<int64_t>(std::min<size_t>(count, INT64_MAX));
+    return Add(std::move(op));
+  }
+  WriteBatch& LSet(std::string_view key, int64_t index,
+                   std::string_view value) {
+    Op op = MakeOp(Op::Type::kLSet, key, value);
+    op.n1 = index;
+    return Add(std::move(op));
+  }
+  WriteBatch& LTrim(std::string_view key, int64_t start, int64_t stop) {
+    Op op = MakeOp(Op::Type::kLTrim, key);
+    op.n1 = start;
+    op.n2 = stop;
+    return Add(std::move(op));
+  }
+
   // Removes all changes from the batch.
   void Clear() { ops_.clear(); }
 
@@ -116,6 +155,12 @@ class WriteBatch {
       kHSet,
       kHDel,
       kHIncr,
+      kLPush,
+      kRPush,
+      kLPop,
+      kRPop,
+      kLSet,
+      kLTrim,
     };
 
     Type type = Type::kSet;
@@ -123,9 +168,13 @@ class WriteBatch {
     // The value for kSet, the suffix for kAppend, the new key for kRename.
     std::string arg;
     std::optional<std::chrono::milliseconds> ttl;  // kSet, kExpire.
-    // kHSet: fields and values, alternating. kHDel: the fields.
+    // kHSet: fields and values, alternating. kHDel: the fields. kLPush and
+    // kRPush: the values.
     std::vector<std::string> items;
-    int64_t n1 = 0;  // kIncr, kDecr, kHIncr: the delta.
+    // kIncr, kDecr, kHIncr: the delta. kLPop, kRPop: how many. kLSet: the
+    // index. kLTrim: the first index to keep.
+    int64_t n1 = 0;
+    int64_t n2 = 0;  // kLTrim: the last index to keep.
   };
 
   static Op MakeOp(Op::Type type, std::string_view key,
