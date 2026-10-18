@@ -108,6 +108,63 @@ class PayloadReader {
   std::string_view data_;
 };
 
+// How a collection record is laid out. After the key come, in this order: a
+// "fresh" flag byte, a list of strings, and up to two integers.
+struct Shape {
+  bool fresh = false;
+  bool strings = false;
+  size_t strings_multiple = 1;  // the count must be a multiple of this...
+  size_t strings_exact = 0;     // ...and, if non-zero, exactly this
+  int ints = 0;                 // 0, 1 (n1) or 2 (n1 and n2)
+  int64_t n1_min = 0;
+  int64_t n2_min = 0;
+};
+
+// Returns the layout of a collection record type, or null for other types.
+const Shape* ShapeOf(Record::Type type) {
+  using T = Record::Type;
+  static const Shape kPairs{
+      .fresh = true, .strings = true, .strings_multiple = 2};
+  static const Shape kFreshStrings{.fresh = true, .strings = true};
+  static const Shape kStrings{.strings = true};
+  static const Shape kCount{.ints = 1, .n1_min = 1};
+  static const Shape kIndexed{.strings = true, .strings_exact = 1, .ints = 1};
+  static const Shape kRange{.ints = 2, .n2_min = -1};
+  switch (type) {
+    case T::kHSet:
+      return &kPairs;
+    case T::kHDel:
+      return &kStrings;
+    case T::kLPush:
+    case T::kRPush:
+      return &kFreshStrings;
+    case T::kLPop:
+    case T::kRPop:
+      return &kCount;
+    case T::kLSet:
+      return &kIndexed;
+    case T::kLTrim:
+      return &kRange;
+    default:
+      return nullptr;
+  }
+}
+
+// Whether the fields of `record` fit the layout of its type.
+bool FitsShape(const Shape& shape, const Record& record) {
+  if (shape.fresh && (record.n1 < 0 || record.n1 > 1)) return false;
+  if (shape.strings) {
+    const size_t n = record.items.size();
+    if (n == 0 || n % shape.strings_multiple != 0) return false;
+    if (shape.strings_exact != 0 && n != shape.strings_exact) return false;
+  } else if (!record.items.empty()) {
+    return false;
+  }
+  if (shape.ints >= 1 && record.n1 < shape.n1_min) return false;
+  if (shape.ints >= 2 && record.n2 < shape.n2_min) return false;
+  return true;
+}
+
 bool HasValue(Record::Type type) {
   return type == Record::Type::kSet || type == Record::Type::kAppend ||
          type == Record::Type::kRename || type == Record::Type::kReplace;
@@ -122,7 +179,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 10) return false;
+  if (type < 1 || type > 16) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -146,21 +203,16 @@ bool DecodeBody(std::string_view body, bool nested, Record* record) {
 
   if (!reader.ReadString(&record->key)) return false;
 
-  if (record->type == Record::Type::kHSet ||
-      record->type == Record::Type::kHDel) {
-    if (record->type == Record::Type::kHSet) {
+  if (const Shape* shape = ShapeOf(record->type)) {
+    if (shape->fresh) {
       uint8_t fresh;
-      if (!reader.ReadU8(&fresh) || fresh > 1) return false;
+      if (!reader.ReadU8(&fresh)) return false;
       record->n1 = fresh;
     }
-    if (!reader.ReadStrings(&record->items) || record->items.empty()) {
-      return false;
-    }
-    // A hash change is field/value pairs.
-    if (record->type == Record::Type::kHSet && record->items.size() % 2 != 0) {
-      return false;
-    }
-    return reader.done();
+    if (shape->strings && !reader.ReadStrings(&record->items)) return false;
+    if (shape->ints >= 1 && !reader.ReadI64(&record->n1)) return false;
+    if (shape->ints >= 2 && !reader.ReadI64(&record->n2)) return false;
+    return reader.done() && FitsShape(*shape, *record);
   }
 
   if (HasValue(record->type) && !reader.ReadString(&record->value)) {
@@ -214,7 +266,7 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kHDel) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kLTrim) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -242,17 +294,15 @@ Status EncodeBody(const Record& record, bool nested, std::string* body) {
       PutU32(body, static_cast<uint32_t>(sub_body.size()));
       body->append(sub_body);
     }
-  } else if (record.type == Record::Type::kHSet ||
-             record.type == Record::Type::kHDel) {
-    if (record.items.empty() || record.n1 < 0 || record.n1 > 1 ||
-        (record.type == Record::Type::kHSet && record.items.size() % 2 != 0)) {
-      return Status(StatusCode::kInvalidArgument, "invalid hash record");
+  } else if (const Shape* shape = ShapeOf(record.type)) {
+    if (!FitsShape(*shape, record)) {
+      return Status(StatusCode::kInvalidArgument, "invalid collection record");
     }
     PutString(body, record.key);
-    if (record.type == Record::Type::kHSet) {
-      body->push_back(static_cast<char>(record.n1));
-    }
-    PutStrings(body, record.items);
+    if (shape->fresh) body->push_back(static_cast<char>(record.n1));
+    if (shape->strings) PutStrings(body, record.items);
+    if (shape->ints >= 1) PutI64(body, record.n1);
+    if (shape->ints >= 2) PutI64(body, record.n2);
   } else {
     PutString(body, record.key);
     if (HasValue(record.type)) PutString(body, record.value);

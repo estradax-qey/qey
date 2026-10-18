@@ -47,6 +47,15 @@ struct Record {
     // that name (which may be a stale entry that expired unnoticed).
     kHSet = 9,   // key, n1 (fresh), items (field, value, field, value, ...)
     kHDel = 10,  // key, items (the fields to remove)
+    // Lists.
+    kLPush = 11,  // key, n1 (fresh), items (pushed one at a time to the head)
+    kRPush = 12,  // key, n1 (fresh), items (pushed one at a time to the tail)
+    kLPop = 13,   // key, n1 (how many to remove from the head, at least 1)
+    kRPop = 14,   // key, n1 (how many to remove from the tail, at least 1)
+    kLSet = 15,   // key, n1 (index, from 0), items (the one new value)
+    // key, n1 and n2: keep elements n1 through n2, both from 0. An n2 below
+    // n1 keeps nothing, which removes the key.
+    kLTrim = 16,
   };
 
   Record() = default;
@@ -67,8 +76,9 @@ struct Record {
   // The strings of a collection change: fields and values, members, or
   // elements, depending on the type.
   std::vector<std::string> items;
-  // Small integer argument. Its meaning depends on the type (see above).
+  // Small integer arguments. Their meaning depends on the type (see above).
   int64_t n1 = 0;
+  int64_t n2 = 0;
 
   bool operator==(const Record&) const = default;
 };

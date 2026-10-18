@@ -48,6 +48,16 @@ Record HDel(std::string key, std::vector<std::string> fields) {
   r.items = std::move(fields);
   return r;
 }
+Record Coll(Type type, std::string key, std::vector<std::string> items,
+            int64_t n1 = 0, int64_t n2 = 0) {
+  Record r;
+  r.type = type;
+  r.key = std::move(key);
+  r.items = std::move(items);
+  r.n1 = n1;
+  r.n2 = n2;
+  return r;
+}
 Record Replace(std::string key, std::string value) {
   return Record{Type::kReplace, std::move(key), std::move(value), {}};
 }
@@ -77,6 +87,13 @@ std::vector<Record> SampleRecords() {
       HSet("h", {"f", "v", "", "", std::string("b\0n", 3), "x"}, 1),
       HSet("h", {"g", "w"}),
       HDel("h", {"f", "nope"}),
+      Coll(Type::kRPush, "l", {"a", "", std::string("b\0", 2)}, 1),
+      Coll(Type::kLPush, "l", {"z"}),
+      Coll(Type::kLPop, "l", {}, 2),
+      Coll(Type::kRPop, "l", {}, 1),
+      Coll(Type::kLSet, "l", {"new"}, 0),
+      Coll(Type::kLTrim, "l", {}, 1, 3),
+      Coll(Type::kLTrim, "l", {}, 0, -1),
       Replace("a", "42"),
       Replace("", ""),
       Batch({Replace("k", "1"), Set("j", "2")}),
@@ -395,6 +412,63 @@ TEST(AppendRecordTest, RejectsInvalidHashRecords) {
   EXPECT_EQ(AppendRecord(f, HDel("h", {})).code(),
             StatusCode::kInvalidArgument);
   EXPECT_EQ(f.Size(), 0);
+}
+
+TEST(AppendRecordTest, RejectsInvalidListRecords) {
+  MemFile f;
+  for (const Record& bad : {
+           Coll(Type::kLPush, "l", {}),            // nothing to push
+           Coll(Type::kRPush, "l", {"a"}, 2),      // bad fresh flag
+           Coll(Type::kLPop, "l", {}, 0),          // must pop at least 1
+           Coll(Type::kRPop, "l", {"x"}, 1),       // takes no strings
+           Coll(Type::kLSet, "l", {"a", "b"}, 0),  // exactly one value
+           Coll(Type::kLSet, "l", {"a"}, -1),      // negative index
+           Coll(Type::kLTrim, "l", {}, -1, 5),     // negative start
+           Coll(Type::kLTrim, "l", {}, 0, -2),     // stop below -1
+           Coll(Type::kLTrim, "l", {"x"}, 0, 1),   // takes no strings
+       }) {
+    EXPECT_EQ(AppendRecord(f, bad).code(), StatusCode::kInvalidArgument);
+  }
+  EXPECT_EQ(f.Size(), 0);
+}
+
+TEST(ReplayTest, ValidChecksumWithMalformedListRecordIsCorruption) {
+  auto u32 = [](uint32_t v) {
+    std::string s;
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  auto i64 = [](int64_t v) {
+    std::string s;
+    for (int i = 0; i < 8; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  const std::string key = u32(1) + "l";
+  const std::string one = u32(1) + "a";
+  const std::vector<std::string> bad_bodies = {
+      std::string("\x0b", 1) + key + std::string("\x00", 1) + u32(0),
+      std::string("\x0c", 1) + key + std::string("\x05", 1) + u32(1) + one,
+      std::string("\x0d", 1) + key + i64(0),                       // pop 0
+      std::string("\x0d", 1) + key,                                // no count
+      std::string("\x0e", 1) + key + i64(1) + "!",                 // trailing
+      std::string("\x0f", 1) + key + u32(1) + one + i64(-1),       // index -1
+      std::string("\x0f", 1) + key + u32(2) + one + one + i64(0),  // 2 values
+      std::string("\x10", 1) + key + i64(0),                       // no stop
+      std::string("\x10", 1) + key + i64(0) + i64(-2),             // stop < -1
+  };
+  for (const std::string& body : bad_bodies) {
+    MemFile f(HeaderBytes() + Frame(body));
+    Replayed r = ReplayAll(f);
+    ASSERT_FALSE(r.result.ok());
+    EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
+  }
+  MemFile ok(HeaderBytes() +
+             Frame(std::string("\x0b", 1) + key + std::string("\x01", 1) +
+                   u32(1) + one) +
+             Frame(std::string("\x0d", 1) + key + i64(1)) +
+             Frame(std::string("\x0f", 1) + key + u32(1) + one + i64(0)) +
+             Frame(std::string("\x10", 1) + key + i64(0) + i64(-1)));
+  EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
 }
 
 TEST(ReplayTest, ValidChecksumWithMalformedHashRecordIsCorruption) {
