@@ -70,6 +70,59 @@ bazel build //...
 bazel test //...
 ```
 
+## Command line
+
+`qey` runs one command against a database file and exits. It never prompts, so
+a script or an AI agent can drive it with arguments alone.
+
+```
+bazel build -c opt //cli:qey        # then use bazel-bin/cli/qey
+
+qey --db app.qey set greeting hello --ttl 1h
+qey --db app.qey get greeting                    # hello
+qey --db app.qey hset user:1 name Ann city Oslo
+qey --db app.qey zadd scores 91.5 ann 78 bo
+qey --db app.qey zrange scores 0 -1 --withscores
+qey --db app.qey batch decr stock 2 -- incr sold 2 -- set order:1 paid
+echo -n "$BIG" | qey --db app.qey set blob --stdin
+```
+
+For programs, add `--json`. Every command then prints one line on standard
+output, success or failure:
+
+```
+$ qey --db app.qey --json get greeting
+{"ok":true,"result":"hello"}
+$ qey --db app.qey --json lpush greeting x
+{"ok":false,"error":{"code":"WRONG_TYPE","message":"the key holds a different type of value"}}
+```
+
+- **Exit codes:** `0` success (a missing key is a normal answer, `null`),
+  `1` the command line is wrong, `2` the database refused (wrong type, I/O
+  error, ...). The `code` in an error is stable: `USAGE`, `WRONG_TYPE`,
+  `NOT_INTEGER`, `OUT_OF_RANGE`, `INVALID_ARGUMENT`, `NOT_FOUND`,
+  `UNAVAILABLE`, `IO_ERROR`, `CORRUPTION`.
+- **Discovery:** `qey commands --json` lists every command with its usage;
+  `qey help <command>` explains one.
+- **Binary data:** values are written as they are; in JSON, a string that is
+  not valid UTF-8 is written as `{"base64": "..."}` so no byte is lost.
+- **Safe by default:** a read command on a path that does not exist reports
+  `NOT_FOUND` rather than creating an empty file, and a database that another
+  process has open is reported as `UNAVAILABLE`, not waited for. A literal value
+  that starts with `--` goes after a lone `--`.
+- **Several changes in one process:** each invocation opens the file, so for
+  many changes use `batch`, which applies its commands, separated by `--`,
+  atomically.
+
+## Benchmarks
+
+`qey_bench` measures speed, memory per element and the size of the `.qey`
+file. See [docs/benchmarks.md](docs/benchmarks.md) for how, and for a run.
+
+```
+bazel run -c opt //bench:qey_bench
+```
+
 ## Contributing
 
 Follow [AGENTS.md](AGENTS.md): Google C++ style (checked by CI) and

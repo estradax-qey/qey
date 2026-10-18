@@ -67,8 +67,18 @@ Follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.
 
 ## Layout
 
-- `qey/` - library sources and headers, with a `BUILD.bazel` per package.
+- `qey/` - the library: the store (`db`), the log format (`log`), storage
+  (`storage`, `posix_storage`), value types (`value`), `write_batch`.
+- `cli/` - `qey`, a non-interactive command-line tool (`qey --db FILE <command>`;
+  `--json` for machine-readable output). It must never prompt or read standard
+  input unless a flag asks for it.
+- `bench/` - `qey_bench`, which measures speed, memory and file size. Build it
+  with `-c opt` (`bazel run -c opt //bench:qey_bench`).
+- `docs/` - design notes and benchmark results.
 - Tests sit next to the code as `*_test.cc`.
+
+When you add a command to the library, add it to the CLI's command table in
+`cli/commands.cc` too, with a test in `cli/cli_test.cc`.
 
 ## Conventions
 
