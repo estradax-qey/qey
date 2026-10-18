@@ -13,6 +13,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned so that formatting does not change under us. Keep the version in
+      # sync with AGENTS.md.
+      - name: Check clang-format
+        run: |
+          pipx run clang-format==17.0.6 --version
+          git ls-files '*.cc' '*.h' | xargs pipx run clang-format==17.0.6 --dry-run --Werror
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
