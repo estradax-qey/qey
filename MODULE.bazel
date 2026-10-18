@@ -1,0 +1,6 @@
+module(
+    name = "qey",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "googletest", version = "1.17.0")
