@@ -37,12 +37,8 @@ bazel test //...
 
 ## Contributing
 
-Follow [AGENTS.md](AGENTS.md): Google C++ style, Conventional Commits. Enable
-the format check that runs before each commit:
-
-```
-git config core.hooksPath .githooks
-```
+Follow [AGENTS.md](AGENTS.md): Google C++ style (checked by CI) and
+Conventional Commits.
 
 ## License
 
