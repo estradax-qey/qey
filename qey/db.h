@@ -16,6 +16,19 @@ namespace qey {
 // Expiry is lazy: an expired key is removed the next time it is accessed.
 class Db {
  public:
+  // The expiry state of a key, as reported by GetTtl().
+  enum class TtlState {
+    kMissing,   // The key does not exist (or has expired).
+    kNoExpiry,  // The key exists and never expires.
+    kExpiring,  // The key exists and expires after `remaining`.
+  };
+
+  struct TtlInfo {
+    TtlState state;
+    // Time until expiry, rounded down. Only meaningful for kExpiring.
+    std::chrono::milliseconds remaining{0};
+  };
+
   using Clock = std::chrono::steady_clock;
   using NowFn = std::function<Clock::time_point()>;
 
@@ -38,6 +51,19 @@ class Db {
 
   // Removes `key`. Returns true if a live key was removed.
   bool Del(std::string_view key);
+
+  // Returns true if `key` exists and has not expired.
+  bool Exists(std::string_view key);
+
+  // Makes `key` expire after `ttl`, replacing any existing TTL. Returns true
+  // if the key exists. A non-positive `ttl` expires the key immediately.
+  bool Expire(std::string_view key, std::chrono::milliseconds ttl);
+
+  // Removes the TTL from `key`. Returns true if the key had a TTL.
+  bool Persist(std::string_view key);
+
+  // Reports the expiry state of `key`.
+  TtlInfo GetTtl(std::string_view key);
 
  private:
   struct Entry {

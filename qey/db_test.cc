@@ -75,6 +75,67 @@ TEST_F(DbTest, SetWithoutTtlClearsPreviousTtl) {
   EXPECT_EQ(db_.Get("k"), "v2");
 }
 
+TEST_F(DbTest, ExistsReflectsLiveKeys) {
+  EXPECT_FALSE(db_.Exists("k"));
+  db_.Set("k", "v", milliseconds(100));
+  EXPECT_TRUE(db_.Exists("k"));
+  Advance(milliseconds(100));
+  EXPECT_FALSE(db_.Exists("k"));
+}
+
+TEST_F(DbTest, ExpireSetsTtlOnExistingKey) {
+  db_.Set("k", "v");
+  EXPECT_TRUE(db_.Expire("k", milliseconds(50)));
+  Advance(milliseconds(50));
+  EXPECT_EQ(db_.Get("k"), std::nullopt);
+}
+
+TEST_F(DbTest, ExpireReplacesExistingTtl) {
+  db_.Set("k", "v", milliseconds(50));
+  EXPECT_TRUE(db_.Expire("k", milliseconds(500)));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Get("k"), "v");
+}
+
+TEST_F(DbTest, ExpireMissingKeyReturnsFalse) {
+  EXPECT_FALSE(db_.Expire("nope", milliseconds(50)));
+}
+
+TEST_F(DbTest, ExpireWithNonPositiveTtlExpiresImmediately) {
+  db_.Set("k", "v");
+  EXPECT_TRUE(db_.Expire("k", milliseconds(0)));
+  EXPECT_FALSE(db_.Exists("k"));
+}
+
+TEST_F(DbTest, PersistRemovesTtl) {
+  db_.Set("k", "v", milliseconds(50));
+  EXPECT_TRUE(db_.Persist("k"));
+  Advance(milliseconds(1000));
+  EXPECT_EQ(db_.Get("k"), "v");
+}
+
+TEST_F(DbTest, PersistReturnsFalseWithoutTtlOrKey) {
+  db_.Set("k", "v");
+  EXPECT_FALSE(db_.Persist("k"));
+  EXPECT_FALSE(db_.Persist("nope"));
+}
+
+TEST_F(DbTest, GetTtlReportsState) {
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kMissing);
+
+  db_.Set("k", "v");
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kNoExpiry);
+
+  db_.Expire("k", milliseconds(100));
+  Advance(milliseconds(30));
+  Db::TtlInfo info = db_.GetTtl("k");
+  EXPECT_EQ(info.state, Db::TtlState::kExpiring);
+  EXPECT_EQ(info.remaining, milliseconds(70));
+
+  Advance(milliseconds(70));
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kMissing);
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   db.Set("k", "v", milliseconds(60000));
