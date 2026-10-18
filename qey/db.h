@@ -84,6 +84,11 @@ class Db {
     std::chrono::milliseconds remaining{0};
   };
 
+  // The longest TTL accepted, about 100 years. Longer ones are rejected, so
+  // that time arithmetic cannot overflow.
+  static constexpr std::chrono::milliseconds kMaxTtl{
+      std::chrono::hours(24 * 365 * 100)};
+
   using Clock = std::chrono::steady_clock;
   using NowFn = std::function<Clock::time_point()>;
   using WallNowFn = std::function<std::chrono::system_clock::time_point()>;
@@ -110,7 +115,9 @@ class Db {
   Db& operator=(const Db&) = delete;
 
   // Sets `key` to `value`, replacing any existing value and TTL. If `ttl` is
-  // set, the key expires after that duration; otherwise it never expires.
+  // set, the key expires after that duration; otherwise it never expires. A
+  // non-positive `ttl` makes the key expire immediately. Fails with
+  // kInvalidArgument, changing nothing, if `ttl` exceeds kMaxTtl.
   Status Set(std::string_view key, std::string_view value,
              std::optional<std::chrono::milliseconds> ttl = std::nullopt);
 
@@ -143,7 +150,8 @@ class Db {
   bool Exists(std::string_view key);
 
   // Makes `key` expire after `ttl`, replacing any existing TTL. Returns true
-  // if the key exists. A non-positive `ttl` expires the key immediately.
+  // if the key exists. A non-positive `ttl` expires the key immediately. Fails
+  // with kInvalidArgument, changing nothing, if `ttl` exceeds kMaxTtl.
   StatusOr<bool> Expire(std::string_view key, std::chrono::milliseconds ttl);
 
   // Removes the TTL from `key`. Returns true if the key had a TTL.

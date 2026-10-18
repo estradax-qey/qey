@@ -20,6 +20,22 @@
 #include "qey/storage.h"
 
 namespace qey {
+namespace {
+
+Status CheckTtl(std::chrono::milliseconds ttl) {
+  if (ttl > Db::kMaxTtl) {
+    return Status(StatusCode::kInvalidArgument, "ttl is longer than kMaxTtl");
+  }
+  return Status::Ok();
+}
+
+// A TTL that is not positive expires the key immediately. Clamping it to zero
+// also keeps very negative values from overflowing time arithmetic.
+std::chrono::milliseconds ClampTtl(std::chrono::milliseconds ttl) {
+  return std::max(ttl, std::chrono::milliseconds(0));
+}
+
+}  // namespace
 
 Db::Db() : Db(&Clock::now) {}
 
@@ -96,10 +112,14 @@ Status Db::Recover(Recovery recovery) {
 
 Status Db::Set(std::string_view key, std::string_view value,
                std::optional<std::chrono::milliseconds> ttl) {
+  if (ttl.has_value()) {
+    Status valid = CheckTtl(*ttl);
+    if (!valid.ok()) return valid;
+  }
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
   std::optional<Clock::time_point> expires_at;
-  if (ttl.has_value()) expires_at = now_() + *ttl;
+  if (ttl.has_value()) expires_at = now_() + ClampTtl(*ttl);
 
   Record record{Record::Type::kSet, std::string(key), std::string(value),
                 std::nullopt};
@@ -168,11 +188,13 @@ bool Db::Exists(std::string_view key) {
 }
 
 StatusOr<bool> Db::Expire(std::string_view key, std::chrono::milliseconds ttl) {
+  Status valid = CheckTtl(ttl);
+  if (!valid.ok()) return valid;
   std::lock_guard<std::mutex> lock(mu_);
   MaybeCompactLocked();
   auto it = FindLive(key);
   if (it == map_.end()) return false;
-  const Clock::time_point at = now_() + ttl;
+  const Clock::time_point at = now_() + ClampTtl(ttl);
   Status s = LogLocked(
       Record{Record::Type::kExpire, std::string(key), "", ToWallMs(at)});
   if (!s.ok()) return s;
@@ -373,21 +395,32 @@ void Db::ApplyRecordLocked(Record&& record) {
 }
 
 int64_t Db::ToWallMs(Clock::time_point at) {
-  const auto wall =
-      wall_now_() +
-      std::chrono::duration_cast<std::chrono::system_clock::duration>(at -
-                                                                      now_());
-  const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         wall.time_since_epoch())
-                         .count();
-  return std::max<int64_t>(ms, 0);
+  // Work in whole milliseconds. `at` is at most kMaxTtl from now, so none of
+  // this can overflow.
+  const int64_t wall_now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          wall_now_().time_since_epoch())
+          .count();
+  const int64_t delta_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(at - now_())
+          .count();
+  return std::max<int64_t>(wall_now_ms + delta_ms, 0);
 }
 
 Db::Clock::time_point Db::FromWallMs(int64_t unix_ms) {
-  const auto at = std::chrono::system_clock::time_point(
-      std::chrono::duration_cast<std::chrono::system_clock::duration>(
-          std::chrono::milliseconds(unix_ms)));
-  return now_() + std::chrono::duration_cast<Clock::duration>(at - wall_now_());
+  // The log may hold any value, so saturate instead of overflowing: an expiry
+  // further away than kMaxTtl is treated as kMaxTtl away.
+  const int64_t wall_now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          wall_now_().time_since_epoch())
+          .count();
+  const int64_t max_ms = kMaxTtl.count();
+  int64_t delta_ms;
+  if (__builtin_sub_overflow(unix_ms, wall_now_ms, &delta_ms)) {
+    delta_ms = max_ms;
+  }
+  delta_ms = std::clamp<int64_t>(delta_ms, -max_ms, max_ms);
+  return now_() + std::chrono::milliseconds(delta_ms);
 }
 
 void Db::SetExpiryLocked(Map::iterator it, Clock::time_point at) {

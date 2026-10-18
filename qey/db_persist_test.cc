@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -129,6 +130,45 @@ TEST_F(PersistTest, KeysExpiredWhileClosedAreDroppedOnOpen) {
   EXPECT_FALSE(db->Exists("short"));
   EXPECT_TRUE(db->Exists("long"));
   EXPECT_TRUE(db->Exists("forever"));
+}
+
+TEST_F(PersistTest, MaxTtlSurvivesReopen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("k", "v", Db::kMaxTtl).ok());
+    EXPECT_EQ(db->Set("bad", "v", milliseconds::max()).code(),
+              StatusCode::kInvalidArgument);
+  }
+  const uint64_t size = file_.Size();
+  Restart(seconds(60));
+  auto db = Open();
+  EXPECT_EQ(file_.Size(), size);  // the rejected write logged nothing
+  EXPECT_EQ(db->GetTtl("k").remaining, Db::kMaxTtl - seconds(60));
+  EXPECT_FALSE(db->Exists("bad"));
+}
+
+TEST_F(PersistTest, AbsurdExpiryInLogIsSaturatedNotOverflowed) {
+  ASSERT_TRUE(WriteHeader(file_).ok());
+  const int64_t kInt64Max = std::numeric_limits<int64_t>::max();
+  for (int64_t at : {kInt64Max, kInt64Max / 2, int64_t{1} << 62}) {
+    ASSERT_TRUE(AppendRecord(file_, Record{Record::Type::kSet,
+                                           "k" + std::to_string(at), "v", at})
+                    .ok());
+  }
+  ASSERT_TRUE(
+      AppendRecord(file_, Record{Record::Type::kSet, "past", "v", int64_t{0}})
+          .ok());
+
+  auto db = Open();
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(db->Size(), 3);  // "past" expired long ago
+  for (const std::string& k :
+       {"k" + std::to_string(kInt64Max), "k" + std::to_string(kInt64Max / 2),
+        "k" + std::to_string(int64_t{1} << 62)}) {
+    Db::TtlInfo info = db->GetTtl(k);
+    EXPECT_EQ(info.state, Db::TtlState::kExpiring) << k;
+    EXPECT_EQ(info.remaining, Db::kMaxTtl) << k;
+  }
 }
 
 TEST_F(PersistTest, ExpirePersistAndOverwriteSurviveReopen) {

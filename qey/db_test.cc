@@ -269,6 +269,47 @@ TEST_F(DbTest, SweepAfterDelDoesNotTouchOtherKeys) {
   EXPECT_EQ(db_.Size(), 0);
 }
 
+TEST_F(DbTest, SetRejectsTtlBeyondMaxAndChangesNothing) {
+  Set("k", "old");
+  for (milliseconds ttl :
+       {Db::kMaxTtl + milliseconds(1), milliseconds::max()}) {
+    EXPECT_EQ(db_.Set("k", "new", ttl).code(), StatusCode::kInvalidArgument);
+  }
+  EXPECT_EQ(db_.Get("k"), "old");
+  EXPECT_EQ(db_.GetTtl("k").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db_.Set("fresh", "v", milliseconds::max()).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("fresh"));
+}
+
+TEST_F(DbTest, ExpireRejectsTtlBeyondMaxAndChangesNothing) {
+  Set("k", "v", milliseconds(500));
+  EXPECT_EQ(db_.Expire("k", milliseconds::max()).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.Expire("k", Db::kMaxTtl + milliseconds(1)).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(db_.GetTtl("k").remaining, milliseconds(500));
+  // A missing key is still an argument error, not "false".
+  EXPECT_FALSE(db_.Expire("nope", milliseconds::max()).ok());
+}
+
+TEST_F(DbTest, MaxTtlIsAccepted) {
+  Set("k", "v", Db::kMaxTtl);
+  Db::TtlInfo info = db_.GetTtl("k");
+  EXPECT_EQ(info.state, Db::TtlState::kExpiring);
+  EXPECT_EQ(info.remaining, Db::kMaxTtl);
+  EXPECT_TRUE(Expire("k", Db::kMaxTtl));
+  EXPECT_EQ(db_.Get("k"), "v");
+}
+
+TEST_F(DbTest, VeryNegativeTtlExpiresImmediately) {
+  Set("a", "v", milliseconds::min());
+  EXPECT_FALSE(db_.Exists("a"));
+  Set("b", "v");
+  EXPECT_TRUE(Expire("b", milliseconds::min()));
+  EXPECT_FALSE(db_.Exists("b"));
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   ASSERT_TRUE(db.Set("k", "v", milliseconds(60000)).ok());
