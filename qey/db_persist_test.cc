@@ -2,11 +2,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <random>
 #include <string>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include "qey/db.h"
@@ -240,6 +242,179 @@ TEST_F(PersistTest, SyncPolicyManualSyncsOnlyWhenAsked) {
   EXPECT_EQ(file_.sync_count(), base + 1);
 }
 
+// Options for SyncPolicy::kInterval driven by the fake clock, with no thread.
+OpenOptions IntervalOptions(OpenOptions o) {
+  o.sync = SyncPolicy::kInterval;
+  o.sync_interval = seconds(1);
+  o.sync_thread = false;
+  return o;
+}
+
+TEST_F(PersistTest, IntervalPolicySyncsInlineOncePerInterval) {
+  auto db = Open(IntervalOptions(Options()));
+  const int base = file_.sync_count();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  EXPECT_EQ(file_.sync_count(), base);  // not due yet
+  Advance(milliseconds(500));
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  EXPECT_EQ(file_.sync_count(), base);
+  Advance(milliseconds(600));
+  ASSERT_TRUE(db->Set("c", "3").ok());
+  EXPECT_EQ(file_.sync_count(), base + 1);  // the interval has passed
+  ASSERT_TRUE(db->Set("d", "4").ok());
+  EXPECT_EQ(file_.sync_count(), base + 1);  // and the timer restarted
+  Advance(seconds(1));
+  ASSERT_TRUE(db->Set("e", "5").ok());
+  EXPECT_EQ(file_.sync_count(), base + 2);
+}
+
+TEST_F(PersistTest, SyncIfDueSyncsOnlyDirtyDataPastTheInterval) {
+  auto db = Open(IntervalOptions(Options()));
+  const int base = file_.sync_count();
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  Advance(seconds(5));
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  EXPECT_EQ(file_.sync_count(), base);  // nothing to sync
+
+  ASSERT_TRUE(db->Set("a", "1").ok());  // due, so this write syncs itself
+  EXPECT_EQ(file_.sync_count(), base + 1);
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  EXPECT_EQ(file_.sync_count(), base + 1);  // dirty, but not due
+  Advance(seconds(1));
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  EXPECT_EQ(file_.sync_count(), base + 2);
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  EXPECT_EQ(file_.sync_count(), base + 2);  // clean again
+}
+
+TEST_F(PersistTest, ExplicitSyncResetsTheIntervalTimer) {
+  auto db = Open(IntervalOptions(Options()));
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  ASSERT_TRUE(db->Sync().ok());
+  const int base = file_.sync_count();
+  Advance(seconds(5));
+  ASSERT_TRUE(db->SyncIfDue().ok());
+  EXPECT_EQ(file_.sync_count(), base);  // already clean
+}
+
+TEST_F(PersistTest, SyncIfDueDoesNothingUnderOtherPolicies) {
+  for (SyncPolicy policy : {SyncPolicy::kAlways, SyncPolicy::kManual}) {
+    file_.data().clear();
+    auto db = Open(Options(policy));
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    const int base = file_.sync_count();
+    Advance(seconds(60));
+    ASSERT_TRUE(db->SyncIfDue().ok());
+    EXPECT_EQ(file_.sync_count(), base);
+  }
+}
+
+TEST_F(PersistTest, DestructorSyncsWritesThatAreNotOnDisk) {
+  for (SyncPolicy policy : {SyncPolicy::kManual, SyncPolicy::kInterval}) {
+    file_.data().clear();
+    OpenOptions o = IntervalOptions(Options(policy));
+    o.sync = policy;
+    auto db = Open(o);
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    const int base = file_.sync_count();
+    db.reset();
+    EXPECT_EQ(file_.sync_count(), base + 1);
+  }
+
+  file_.data().clear();
+  auto db = Open();  // kAlways has nothing left to sync
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  const int base = file_.sync_count();
+  db.reset();
+  EXPECT_EQ(file_.sync_count(), base);
+}
+
+TEST_F(PersistTest, IntervalSyncFailureFailsTheWrite) {
+  auto db = Open(IntervalOptions(Options()));
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  Advance(seconds(1));  // the next write will sync
+
+  file_.FailSyncs(true);
+  Status s = db->Set("b", "2");
+  EXPECT_EQ(s.code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("b"), std::nullopt);
+
+  file_.FailSyncs(false);
+  Status later = db->Set("c", "3");
+  EXPECT_EQ(later.code(), StatusCode::kIoError);
+  EXPECT_NE(later.message().find("injected sync failure"), std::string::npos)
+      << later.message();  // the first cause is reported
+}
+
+TEST_F(PersistTest, IntervalPolicyRequiresPositiveInterval) {
+  for (milliseconds bad : {milliseconds(0), milliseconds(-5)}) {
+    OpenOptions o = IntervalOptions(Options());
+    o.sync_interval = bad;
+    EXPECT_EQ(TryOpen(o).status().code(), StatusCode::kInvalidArgument);
+  }
+}
+
+// The tests below use the real clock for the background thread, with a short
+// interval, and wait for the effect instead of sleeping a fixed time.
+bool WaitFor(const std::function<bool()>& done) {
+  const auto deadline = std::chrono::steady_clock::now() + seconds(10);
+  while (!done()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(milliseconds(2));
+  }
+  return true;
+}
+
+OpenOptions ThreadOptions(OpenOptions o) {
+  o.sync = SyncPolicy::kInterval;
+  o.sync_interval = milliseconds(10);
+  o.sync_thread = true;
+  return o;
+}
+
+TEST_F(PersistTest, BackgroundThreadSyncsIdleWrites) {
+  auto db = Open(ThreadOptions(Options()));
+  const int base = file_.sync_count();
+  ASSERT_TRUE(db->Set("a", "1").ok());  // no further writes follow
+  EXPECT_TRUE(WaitFor([&] { return file_.sync_count() > base; }));
+}
+
+TEST_F(PersistTest, BackgroundThreadDoesNotSyncWhenThereIsNothingToSync) {
+  auto db = Open(ThreadOptions(Options()));
+  const int base = file_.sync_count();
+  std::this_thread::sleep_for(milliseconds(150));  // many intervals
+  EXPECT_EQ(file_.sync_count(), base);
+}
+
+TEST_F(PersistTest, BackgroundSyncFailureSurfacesOnNextWrite) {
+  auto db = Open(ThreadOptions(Options()));
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  file_.FailSyncs(true);
+  Status last;
+  ASSERT_TRUE(WaitFor([&] {
+    last = db->Set("x", "y");
+    return !last.ok();
+  }));
+  EXPECT_EQ(last.code(), StatusCode::kIoError);
+  EXPECT_NE(last.message().find("injected sync failure"), std::string::npos)
+      << last.message();
+  EXPECT_EQ(db->Sync().code(), StatusCode::kIoError);
+}
+
+TEST_F(PersistTest, DestroyingWhileThreadRunsSyncsExactlyOnce) {
+  for (int i = 0; i < 20; ++i) {
+    file_.data().clear();
+    OpenOptions o = ThreadOptions(Options());
+    o.sync_interval = milliseconds(1);  // make the thread race the destructor
+    auto db = Open(o);
+    const int base = file_.sync_count();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    db.reset();  // the thread or the destructor syncs, never both
+    EXPECT_EQ(file_.sync_count(), base + 1) << "i=" << i;
+  }
+}
+
 TEST_F(PersistTest, InMemoryDbSyncIsNoOp) {
   Db db;
   EXPECT_TRUE(db.Sync().ok());
@@ -400,7 +575,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
     } else {
       options.auto_compact = false;
     }
-    file_ = MemFile();
+    file_.data().clear();
     steady_ = Db::Clock::time_point(seconds(1000));
     wall_ = std::chrono::system_clock::time_point(seconds(1700000000));
 

@@ -1,6 +1,7 @@
 #ifndef QEY_MEMORY_FILE_H_
 #define QEY_MEMORY_FILE_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -44,8 +45,9 @@ class MemFile : public File {
  private:
   std::string data_;
   std::optional<uint64_t> limit_;
-  int sync_count_ = 0;
-  bool fail_syncs_ = false;
+  // Atomic because a Db may sync from its background thread.
+  std::atomic<int> sync_count_{0};
+  std::atomic<bool> fail_syncs_{false};
   bool fail_truncates_ = false;
 };
 

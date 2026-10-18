@@ -59,6 +59,11 @@ StatusOr<std::unique_ptr<Db>> Db::Open(std::unique_ptr<Storage> storage,
   if (storage == nullptr) {
     return Status(StatusCode::kInvalidArgument, "storage is null");
   }
+  if (options.sync == SyncPolicy::kInterval &&
+      options.sync_interval <= std::chrono::milliseconds(0)) {
+    return Status(StatusCode::kInvalidArgument,
+                  "sync_interval must be positive");
+  }
   options.compact_ratio = std::max<uint32_t>(options.compact_ratio, 1);
   NowFn now = options.now ? std::move(options.now) : NowFn(&Clock::now);
   WallNowFn wall_now =
@@ -70,7 +75,27 @@ StatusOr<std::unique_ptr<Db>> Db::Open(std::unique_ptr<Storage> storage,
   db->options_ = options;
   Status s = db->Recover(options.recovery);
   if (!s.ok()) return s;
+  if (options.sync == SyncPolicy::kInterval && options.sync_thread) {
+    Db* raw = db.get();
+    db->sync_thread_ = std::thread([raw] { raw->SyncThreadMain(); });
+  }
   return StatusOr<std::unique_ptr<Db>>(std::move(db));
+}
+
+Db::~Db() {
+  if (sync_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+    }
+    stop_cv_.notify_all();
+    sync_thread_.join();
+  }
+  if (storage_ != nullptr) {
+    // A clean close leaves nothing unsynced, whatever the policy.
+    std::lock_guard<std::mutex> lock(mu_);
+    if (unsynced_ && failure_.ok()) SyncLocked().IgnoreError();
+  }
 }
 
 Status Db::Recover(Recovery recovery) {
@@ -96,6 +121,7 @@ Status Db::Recover(Recovery recovery) {
     if (!s.ok()) return s;
   }
 
+  last_sync_ = now_();
   recovery_info_.records_replayed = replay->records;
   recovery_info_.dropped_bytes = replay->dropped_bytes;
   Sweep();  // Drop keys that expired while the store was closed.
@@ -217,12 +243,53 @@ StatusOr<bool> Db::Persist(std::string_view key) {
 Status Db::Sync() {
   std::lock_guard<std::mutex> lock(mu_);
   if (storage_ == nullptr) return Status::Ok();
-  if (failed_) {
-    return Status(StatusCode::kIoError, "database failed after an I/O error");
+  Status healthy = CheckHealthyLocked();
+  if (!healthy.ok()) return healthy;
+  return SyncLocked();
+}
+
+Status Db::SyncIfDue() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (storage_ == nullptr || options_.sync != SyncPolicy::kInterval) {
+    return Status::Ok();
   }
+  Status healthy = CheckHealthyLocked();
+  if (!healthy.ok()) return healthy;
+  if (!unsynced_ || now_() - last_sync_ < options_.sync_interval) {
+    return Status::Ok();
+  }
+  return SyncLocked();
+}
+
+Status Db::CheckHealthyLocked() const {
+  if (failure_.ok()) return Status::Ok();
+  return Status(StatusCode::kIoError, "database failed after an I/O error (" +
+                                          failure_.message() + "); reopen it");
+}
+
+void Db::FailLocked(const Status& cause) {
+  if (failure_.ok()) failure_ = cause;
+}
+
+Status Db::SyncLocked() {
   Status s = storage_->log().Sync();
-  if (!s.ok()) failed_ = true;
-  return s;
+  if (!s.ok()) {
+    FailLocked(s);
+    return s;
+  }
+  unsynced_ = false;
+  last_sync_ = now_();
+  return Status::Ok();
+}
+
+void Db::SyncThreadMain() {
+  std::unique_lock<std::mutex> lock(mu_);
+  while (!stopping_) {
+    stop_cv_.wait_for(lock, options_.sync_interval,
+                      [this] { return stopping_; });
+    if (stopping_) break;
+    if (unsynced_ && failure_.ok()) SyncLocked().IgnoreError();
+  }
 }
 
 Db::TtlInfo Db::GetTtl(std::string_view key) {
@@ -280,26 +347,27 @@ StatusOr<int64_t> Db::AddLocked(std::string_view key, int64_t delta,
 
 Status Db::LogLocked(const Record& record) {
   if (storage_ == nullptr) return Status::Ok();
-  if (failed_) {
-    return Status(StatusCode::kIoError, "database failed after an I/O error");
-  }
+  Status healthy = CheckHealthyLocked();
+  if (!healthy.ok()) return healthy;
 
   File& log = storage_->log();
   const uint64_t size_before = log.Size();
   Status s = AppendRecord(log, record);
   if (!s.ok()) {
     // Remove any partial record so that later appends do not follow garbage.
-    if (!log.Truncate(size_before).ok()) failed_ = true;
+    Status undone = log.Truncate(size_before);
+    if (!undone.ok()) FailLocked(undone);
     return s;
   }
-  if (options_.sync == SyncPolicy::kAlways) {
-    s = log.Sync();
-    if (!s.ok()) {
-      // The record may or may not have reached the disk. Memory has not been
-      // updated, so stop accepting writes rather than let the two diverge.
-      failed_ = true;
-      return s;
-    }
+  unsynced_ = true;
+  const bool sync_now = options_.sync == SyncPolicy::kAlways ||
+                        (options_.sync == SyncPolicy::kInterval &&
+                         now_() - last_sync_ >= options_.sync_interval);
+  if (sync_now) {
+    // If this fails, the record may or may not have reached the disk. Memory
+    // has not been updated, so SyncLocked() stops further writes rather than
+    // let the two diverge.
+    return SyncLocked();
   }
   return Status::Ok();
 }
@@ -307,9 +375,8 @@ Status Db::LogLocked(const Record& record) {
 Status Db::Compact() {
   std::lock_guard<std::mutex> lock(mu_);
   if (storage_ == nullptr) return Status::Ok();
-  if (failed_) {
-    return Status(StatusCode::kIoError, "database failed after an I/O error");
-  }
+  Status healthy = CheckHealthyLocked();
+  if (!healthy.ok()) return healthy;
   Status s = CompactLocked();
   if (s.ok()) {
     // Nothing is iterating the map here, so expired keys can go.
@@ -322,7 +389,7 @@ Status Db::Compact() {
 }
 
 void Db::MaybeCompactLocked() {
-  if (storage_ == nullptr || failed_ || !options_.auto_compact) return;
+  if (storage_ == nullptr || !failure_.ok() || !options_.auto_compact) return;
   const uint64_t size = storage_->log().Size();
   if (size <= compact_threshold_) return;
   if (!CompactLocked().ok()) {
@@ -354,6 +421,9 @@ Status Db::CompactLocked() {
     return out.Append(buf);
   });
   if (!s.ok()) return s;
+  // Replace() synced the new log, so everything so far is on disk.
+  unsynced_ = false;
+  last_sync_ = now_();
   SetCompactThreshold(storage_->log().Size());
   return Status::Ok();
 }

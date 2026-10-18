@@ -2,6 +2,7 @@
 #define QEY_DB_H_
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -26,12 +28,23 @@ namespace qey {
 enum class SyncPolicy {
   // After every write. A write that returned OK survives a crash.
   kAlways,
+  // At most OpenOptions::sync_interval after a write, by a background thread
+  // (or by the owner calling Db::SyncIfDue()), and also from writes that
+  // arrive once the interval has elapsed. A crash or power loss can lose
+  // writes from up to about one interval before it; the log stays intact.
+  kInterval,
   // Only when Db::Sync() is called. Faster, but recent writes can be lost.
   kManual,
 };
 
 struct OpenOptions {
   SyncPolicy sync = SyncPolicy::kAlways;
+  // For SyncPolicy::kInterval. Must be positive.
+  std::chrono::milliseconds sync_interval{1000};
+  // For SyncPolicy::kInterval: whether the Db runs a background thread that
+  // syncs every interval. Without it, data is synced only when a write
+  // arrives after the interval, or when the owner calls Db::SyncIfDue().
+  bool sync_thread = true;
   // What to do about a damaged tail of the log. See Replay().
   Recovery recovery = Recovery::kTruncate;
   // Compaction rewrites the log to hold only live data, dropping overwritten
@@ -114,6 +127,11 @@ class Db {
   Db(const Db&) = delete;
   Db& operator=(const Db&) = delete;
 
+  // Stops the background sync thread, if any, and syncs any writes that are
+  // not yet on disk. The caller must make sure no other thread is still using
+  // the Db.
+  ~Db();
+
   // Sets `key` to `value`, replacing any existing value and TTL. If `ttl` is
   // set, the key expires after that duration; otherwise it never expires. A
   // non-positive `ttl` makes the key expire immediately. Fails with
@@ -165,9 +183,15 @@ class Db {
   // is intact and in use. Does nothing for an in-memory Db.
   Status Compact();
 
-  // Flushes the log to stable storage. Needed only with SyncPolicy::kManual.
-  // Does nothing for an in-memory Db.
+  // Flushes the log to stable storage. Needed only with SyncPolicy::kManual
+  // or kInterval. Does nothing for an in-memory Db.
   Status Sync();
+
+  // With SyncPolicy::kInterval, flushes the log if there are unsynced writes
+  // and the interval has passed since the last sync. For owners that run
+  // their own timer instead of the background thread. Does nothing under
+  // other policies.
+  Status SyncIfDue();
 
   // Reports what Open() found in the log. Zeroes for an in-memory Db.
   RecoveryInfo recovery_info() const { return recovery_info_; }
@@ -195,6 +219,21 @@ class Db {
   // Sets the size at which the next automatic compaction happens, given the
   // log size right after a compaction (or the live data size).
   void SetCompactThreshold(uint64_t base_size);
+
+  // Returns OK, or an error if an earlier I/O failure left the log in a state
+  // that cannot be trusted. Requires `mu_` held.
+  Status CheckHealthyLocked() const;
+
+  // Records `cause` as the reason the Db stopped accepting writes. Keeps the
+  // first one. Requires `mu_` held.
+  void FailLocked(const Status& cause);
+
+  // Syncs the log and updates the bookkeeping. A failure puts the Db in the
+  // failed state. Requires `mu_` held.
+  Status SyncLocked();
+
+  // Body of the background sync thread.
+  void SyncThreadMain();
 
   // Appends `record` to the log and syncs it according to the policy. Does
   // nothing without a log. Requires `mu_` held.
@@ -231,7 +270,14 @@ class Db {
   std::unique_ptr<Storage> storage_;  // Null for an in-memory Db.
   OpenOptions options_;
   uint64_t compact_threshold_ = 0;
-  bool failed_ = false;  // A log write failed and could not be undone.
+  // Not OK once a log write or sync failed in a way that cannot be undone;
+  // holds the first cause. Writes are refused from then on.
+  Status failure_;
+  bool unsynced_ = false;  // Records were appended but not synced.
+  Clock::time_point last_sync_;
+  std::thread sync_thread_;
+  std::condition_variable stop_cv_;
+  bool stopping_ = false;
   RecoveryInfo recovery_info_;
   Map map_;
   // Mirrors the expiry of every entry in `map_` that has one, ordered by
