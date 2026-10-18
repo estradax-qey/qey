@@ -6,6 +6,8 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "qey/file.h"
 #include "qey/status.h"
@@ -31,7 +33,19 @@ struct Record {
     kPersist = 4,  // key
     kAppend = 5,   // key, value (the bytes to append)
     kRename = 6,   // key (the source), value (the new key)
+    // `records`: a group of changes that is applied entirely or not at all.
+    // They share one checksum, so a crash cannot leave part of them in the
+    // log. May not be nested, and may not be empty.
+    kBatch = 7,
   };
+
+  Record() = default;
+  Record(Type type, std::string key, std::string value,
+         std::optional<int64_t> expires_at_ms)
+      : type(type),
+        key(std::move(key)),
+        value(std::move(value)),
+        expires_at_ms(expires_at_ms) {}
 
   Type type = Type::kSet;
   std::string key;
@@ -39,6 +53,7 @@ struct Record {
   // Absolute expiry as Unix milliseconds (>= 0). Used by kSet (nullopt means
   // no expiry) and kExpire (required).
   std::optional<int64_t> expires_at_ms;
+  std::vector<Record> records;  // kBatch only.
 
   bool operator==(const Record&) const = default;
 };

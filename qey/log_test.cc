@@ -32,6 +32,12 @@ Record Append(std::string key, std::string suffix) {
 Record Rename(std::string from, std::string to) {
   return Record{Type::kRename, std::move(from), std::move(to), {}};
 }
+Record Batch(std::vector<Record> records) {
+  Record r;
+  r.type = Type::kBatch;
+  r.records = std::move(records);
+  return r;
+}
 Record Persist(std::string key) {
   return Record{Type::kPersist, std::move(key), "", {}};
 }
@@ -47,6 +53,8 @@ std::vector<Record> SampleRecords() {
       Append("a", std::string("\0tail", 5)),
       Rename("b", "c"),
       Append("", ""),
+      Batch({Set("x", "1", 5), Del("y"), Rename("x", "z"), Append("z", "!")}),
+      Batch({Persist("z")}),
       Del("a"),
   };
 }
@@ -274,6 +282,78 @@ TEST(ReplayTest, ValidChecksumWithMalformedBodyIsCorruption) {
     ASSERT_FALSE(r.result.ok());
     EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
   }
+}
+
+TEST(AppendRecordTest, RejectsInvalidBatches) {
+  MemFile f;
+  EXPECT_EQ(AppendRecord(f, Batch({})).code(), StatusCode::kInvalidArgument);
+  EXPECT_EQ(AppendRecord(f, Batch({Batch({Del("a")})})).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(AppendRecord(f, Batch({Set("a", "1"), Set("b", "2", -1)})).code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_EQ(f.Size(), 0);  // nothing was written
+}
+
+TEST(ReplayTest, BatchIsAppliedAsOneRecordWithItsMembersInOrder) {
+  MemFile f;
+  const Record batch = Batch({Set("a", "1"), Del("a"), Set("a", "2")});
+  WriteLog(f, {batch});
+  Replayed r = ReplayAll(f, Recovery::kStrict);
+  ASSERT_TRUE(r.result.ok());
+  ASSERT_EQ(r.records.size(), 1);
+  EXPECT_EQ(r.records[0], batch);
+  EXPECT_EQ(r.result->records, 1);
+}
+
+TEST(ReplayTest, TornBatchIsDroppedWholeNotPartly) {
+  MemFile f;
+  const std::vector<uint64_t> boundaries =
+      WriteLog(f, {Set("before", "1"), Batch({Set("a", "1"), Set("b", "2")})});
+  // Cut anywhere inside the batch record: none of its members survive.
+  for (uint64_t cut = boundaries[1] + 1; cut < boundaries[2]; ++cut) {
+    MemFile copy(f.data().substr(0, cut));
+    Replayed r = ReplayAll(copy);
+    ASSERT_TRUE(r.result.ok()) << "cut=" << cut;
+    EXPECT_EQ(r.records, std::vector<Record>{Set("before", "1")})
+        << "cut=" << cut;
+  }
+}
+
+TEST(ReplayTest, ValidChecksumWithMalformedBatchIsCorruption) {
+  const std::string del_a("\x02\1\0\0\0a", 6);  // a complete kDel body
+  auto u32 = [](uint32_t v) {
+    std::string s;
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  const std::string inner = std::string("\x07", 1) + u32(1) + u32(6) + del_a;
+  const std::vector<std::string> bad_bodies = {
+      std::string("\x07", 1),                                  // no count
+      std::string("\x07", 1) + u32(0),                         // empty batch
+      std::string("\x07", 1) + u32(2) + u32(6) + del_a,        // count too big
+      std::string("\x07", 1) + u32(1) + u32(99) + del_a,       // length too big
+      std::string("\x07", 1) + u32(1) + u32(6) + del_a + "!",  // trailing byte
+      std::string("\x07", 1) + u32(1) + u32(0),                // empty member
+      std::string("\x07", 1) + u32(1) + u32(3) + std::string("\x63\0\0", 3),
+      // A batch inside a batch, otherwise well formed.
+      std::string("\x07", 1) + u32(1) + u32(inner.size()) + inner,
+  };
+  for (const std::string& body : bad_bodies) {
+    MemFile f(HeaderBytes() + Frame(body));
+    Replayed r = ReplayAll(f);
+    ASSERT_FALSE(r.result.ok());
+    EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
+  }
+
+  // Each piece of the nested case is valid on its own, so it is the nesting
+  // that is rejected.
+  MemFile inner_alone(HeaderBytes() + Frame(inner));
+  EXPECT_TRUE(ReplayAll(inner_alone, Recovery::kStrict).result.ok());
+
+  // The well-formed version of the same shape is accepted.
+  MemFile ok(HeaderBytes() +
+             Frame(std::string("\x07", 1) + u32(1) + u32(6) + del_a));
+  EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
 }
 
 TEST(AppendRecordTest, RejectsInvalidRecords) {

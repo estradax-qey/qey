@@ -52,6 +52,20 @@ class PayloadReader {
     return true;
   }
 
+  bool ReadU32(uint32_t* out) {
+    if (data_.size() < 4) return false;
+    *out = GetU32(data_.data());
+    data_.remove_prefix(4);
+    return true;
+  }
+
+  bool ReadBytes(size_t n, std::string_view* out) {
+    if (data_.size() < n) return false;
+    *out = data_.substr(0, n);
+    data_.remove_prefix(n);
+    return true;
+  }
+
   bool ReadString(std::string* out) {
     if (data_.size() < 4) return false;
     const uint32_t n = GetU32(data_.data());
@@ -77,13 +91,33 @@ bool HasExpiry(Record::Type type) {
   return type == Record::Type::kSet || type == Record::Type::kExpire;
 }
 
-// Decodes the body (type byte plus payload) of a record.
-bool DecodeBody(std::string_view body, Record* record) {
+// Decodes the body (type byte plus payload) of a record. `nested` is true for
+// the records inside a batch, which may not themselves be batches.
+bool DecodeBody(std::string_view body, bool nested, Record* record) {
+  if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 6) return false;
+  if (type < 1 || type > 7) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
+
+  if (record->type == Record::Type::kBatch) {
+    if (nested) return false;
+    uint32_t count;
+    if (!reader.ReadU32(&count) || count == 0) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t length;
+      std::string_view sub_body;
+      if (!reader.ReadU32(&length) || !reader.ReadBytes(length, &sub_body)) {
+        return false;
+      }
+      Record sub;
+      if (!DecodeBody(sub_body, /*nested=*/true, &sub)) return false;
+      record->records.push_back(std::move(sub));
+    }
+    return reader.done();
+  }
+
   if (!reader.ReadString(&record->key)) return false;
   if (HasValue(record->type) && !reader.ReadString(&record->value)) {
     return false;
@@ -132,8 +166,11 @@ std::string EncodeHeader() {
 
 Status WriteHeader(File& file) { return file.Append(EncodeHeader()); }
 
-Status EncodeRecord(const Record& record, std::string* out) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kRename) {
+namespace {
+
+// Appends the body (type byte plus payload) of `record` to `body`.
+Status EncodeBody(const Record& record, bool nested, std::string* body) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kBatch) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -145,14 +182,41 @@ Status EncodeRecord(const Record& record, std::string* out) {
     return Status(StatusCode::kInvalidArgument, "expire record needs expiry");
   }
 
-  std::string body;
-  body.push_back(static_cast<char>(record.type));
-  PutString(&body, record.key);
-  if (HasValue(record.type)) PutString(&body, record.value);
-  if (HasExpiry(record.type)) PutI64(&body, record.expires_at_ms.value_or(-1));
-  if (body.size() > kMaxRecordLength) {
+  body->push_back(static_cast<char>(record.type));
+  if (record.type == Record::Type::kBatch) {
+    if (nested) {
+      return Status(StatusCode::kInvalidArgument, "batches cannot be nested");
+    }
+    if (record.records.empty() || record.records.size() > UINT32_MAX) {
+      return Status(StatusCode::kInvalidArgument, "batch size is invalid");
+    }
+    PutU32(body, static_cast<uint32_t>(record.records.size()));
+    for (const Record& sub : record.records) {
+      std::string sub_body;
+      Status s = EncodeBody(sub, /*nested=*/true, &sub_body);
+      if (!s.ok()) return s;
+      PutU32(body, static_cast<uint32_t>(sub_body.size()));
+      body->append(sub_body);
+    }
+  } else {
+    PutString(body, record.key);
+    if (HasValue(record.type)) PutString(body, record.value);
+    if (HasExpiry(record.type)) {
+      PutI64(body, record.expires_at_ms.value_or(-1));
+    }
+  }
+  if (body->size() > kMaxRecordLength) {
     return Status(StatusCode::kInvalidArgument, "record too large");
   }
+  return Status::Ok();
+}
+
+}  // namespace
+
+Status EncodeRecord(const Record& record, std::string* out) {
+  std::string body;
+  Status s = EncodeBody(record, /*nested=*/false, &body);
+  if (!s.ok()) return s;
 
   out->reserve(out->size() + kFrameHeaderSize + body.size());
   PutU32(out, static_cast<uint32_t>(body.size()));
@@ -241,7 +305,7 @@ StatusOr<ReplayResult> Replay(File& file, Recovery recovery,
     }
 
     Record record;
-    if (!DecodeBody(*body, &record)) {
+    if (!DecodeBody(*body, /*nested=*/false, &record)) {
       return Status(StatusCode::kCorruption, "malformed record");
     }
     apply(std::move(record));
