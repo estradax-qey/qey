@@ -402,14 +402,18 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           StatusOr<int64_t> a = persistent->Incr(k, delta);
           StatusOr<int64_t> b = reference.Incr(k, delta);
           ASSERT_EQ(a.ok(), b.ok());
-          if (a.ok()) EXPECT_EQ(*a, *b);
+          if (a.ok()) {
+            EXPECT_EQ(*a, *b);
+          }
           break;
         }
         case 6:
           Advance(milliseconds(pick(20)));
           break;
         case 7:
-          if (pick(10) == 0) ASSERT_TRUE(persistent->Compact().ok());
+          if (pick(10) == 0) {
+            ASSERT_TRUE(persistent->Compact().ok());
+          }
           break;
       }
     }
