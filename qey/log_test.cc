@@ -26,6 +26,12 @@ Record Del(std::string key) {
 Record Expire(std::string key, int64_t at) {
   return Record{Type::kExpire, std::move(key), "", at};
 }
+Record Append(std::string key, std::string suffix) {
+  return Record{Type::kAppend, std::move(key), std::move(suffix), {}};
+}
+Record Rename(std::string from, std::string to) {
+  return Record{Type::kRename, std::move(from), std::move(to), {}};
+}
 Record Persist(std::string key) {
   return Record{Type::kPersist, std::move(key), "", {}};
 }
@@ -38,6 +44,9 @@ std::vector<Record> SampleRecords() {
       Set(std::string("bin\0key", 7), std::string("\0\xff\1", 3), 0),
       Expire("a", 1800000000000),
       Persist("b"),
+      Append("a", std::string("\0tail", 5)),
+      Rename("b", "c"),
+      Append("", ""),
       Del("a"),
   };
 }
@@ -248,6 +257,9 @@ TEST(ReplayTest, ValidChecksumWithMalformedBodyIsCorruption) {
   const std::vector<std::string> bad_bodies = {
       std::string("\x01", 1),                   // kSet with no fields
       std::string("\x63", 1),                   // unknown type 99
+      std::string("\x07", 1),                   // first unassigned type
+      std::string("\x05\1\0\0\0k", 6),          // kAppend without its value
+      std::string("\x06\1\0\0\0k", 6),          // kRename without its new key
       std::string("\x02\1\0\0\0k!", 7),         // kDel with trailing byte
       std::string("\x02\xff\xff\xff\xffk", 6),  // string longer than body
       std::string("\x03\1\0\0\0k", 6) +

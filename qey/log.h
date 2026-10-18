@@ -29,11 +29,13 @@ struct Record {
     kDel = 2,      // key
     kExpire = 3,   // key, expires_at_ms (required)
     kPersist = 4,  // key
+    kAppend = 5,   // key, value (the bytes to append)
+    kRename = 6,   // key (the source), value (the new key)
   };
 
   Type type = Type::kSet;
   std::string key;
-  std::string value;  // kSet only.
+  std::string value;  // kSet, kAppend and kRename only.
   // Absolute expiry as Unix milliseconds (>= 0). Used by kSet (nullopt means
   // no expiry) and kExpire (required).
   std::optional<int64_t> expires_at_ms;

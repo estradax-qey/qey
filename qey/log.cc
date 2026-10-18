@@ -68,6 +68,11 @@ class PayloadReader {
   std::string_view data_;
 };
 
+bool HasValue(Record::Type type) {
+  return type == Record::Type::kSet || type == Record::Type::kAppend ||
+         type == Record::Type::kRename;
+}
+
 bool HasExpiry(Record::Type type) {
   return type == Record::Type::kSet || type == Record::Type::kExpire;
 }
@@ -75,13 +80,12 @@ bool HasExpiry(Record::Type type) {
 // Decodes the body (type byte plus payload) of a record.
 bool DecodeBody(std::string_view body, Record* record) {
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 4) return false;
+  if (type < 1 || type > 6) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
   if (!reader.ReadString(&record->key)) return false;
-  if (record->type == Record::Type::kSet &&
-      !reader.ReadString(&record->value)) {
+  if (HasValue(record->type) && !reader.ReadString(&record->value)) {
     return false;
   }
   if (HasExpiry(record->type)) {
@@ -129,8 +133,7 @@ std::string EncodeHeader() {
 Status WriteHeader(File& file) { return file.Append(EncodeHeader()); }
 
 Status EncodeRecord(const Record& record, std::string* out) {
-  if (record.type < Record::Type::kSet ||
-      record.type > Record::Type::kPersist) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kRename) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -145,7 +148,7 @@ Status EncodeRecord(const Record& record, std::string* out) {
   std::string body;
   body.push_back(static_cast<char>(record.type));
   PutString(&body, record.key);
-  if (record.type == Record::Type::kSet) PutString(&body, record.value);
+  if (HasValue(record.type)) PutString(&body, record.value);
   if (HasExpiry(record.type)) PutI64(&body, record.expires_at_ms.value_or(-1));
   if (body.size() > kMaxRecordLength) {
     return Status(StatusCode::kInvalidArgument, "record too large");
