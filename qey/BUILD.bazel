@@ -1,0 +1,15 @@
+cc_library(
+    name = "db",
+    srcs = ["db.cc"],
+    hdrs = ["db.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "db_test",
+    srcs = ["db_test.cc"],
+    deps = [
+        ":db",
+        "@googletest//:gtest_main",
+    ],
+)
