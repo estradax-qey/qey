@@ -52,12 +52,23 @@ class [[nodiscard]] StatusOr {
   const Status& status() const { return status_; }
 
   // Requires ok().
-  const T& value() const {
+  const T& value() const& {
     assert(ok());
     return *value_;
   }
-  const T& operator*() const { return value(); }
+  T& value() & {
+    assert(ok());
+    return *value_;
+  }
+  T&& value() && {
+    assert(ok());
+    return *std::move(value_);
+  }
+  const T& operator*() const& { return value(); }
+  T& operator*() & { return value(); }
+  T&& operator*() && { return std::move(*this).value(); }
   const T* operator->() const { return &value(); }
+  T* operator->() { return &value(); }
 
  private:
   Status status_;

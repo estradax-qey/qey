@@ -26,11 +26,15 @@ Status MemFile::Append(std::string_view data) {
 }
 
 Status MemFile::Sync() {
+  if (fail_syncs_) return Status(StatusCode::kIoError, "injected sync failure");
   ++sync_count_;
   return Status::Ok();
 }
 
 Status MemFile::Truncate(uint64_t size) {
+  if (fail_truncates_) {
+    return Status(StatusCode::kIoError, "injected truncate failure");
+  }
   if (size > data_.size()) {
     return Status(StatusCode::kInvalidArgument,
                   "cannot truncate to a larger size");

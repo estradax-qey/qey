@@ -35,10 +35,38 @@ class MemFile : public File {
   // like a write torn by a crash. Pass std::nullopt to clear the limit.
   void FailAppendsBeyond(std::optional<uint64_t> size) { limit_ = size; }
 
+  // Makes Sync() or Truncate() fail with kIoError.
+  void FailSyncs(bool fail) { fail_syncs_ = fail; }
+  void FailTruncates(bool fail) { fail_truncates_ = fail; }
+
  private:
   std::string data_;
   std::optional<uint64_t> limit_;
   int sync_count_ = 0;
+  bool fail_syncs_ = false;
+  bool fail_truncates_ = false;
+};
+
+// A File that forwards to another File without owning it. Lets a test hand a
+// File to code that takes ownership, while keeping access to the underlying
+// MemFile, e.g. to reopen a database on the same bytes. `target` must outlive
+// this object.
+class FileRef : public File {
+ public:
+  explicit FileRef(File* target) : target_(target) {}
+
+  StatusOr<std::string> Read(uint64_t offset, size_t n) override {
+    return target_->Read(offset, n);
+  }
+  Status Append(std::string_view data) override {
+    return target_->Append(data);
+  }
+  Status Sync() override { return target_->Sync(); }
+  Status Truncate(uint64_t size) override { return target_->Truncate(size); }
+  uint64_t Size() const override { return target_->Size(); }
+
+ private:
+  File* target_;
 };
 
 }  // namespace qey

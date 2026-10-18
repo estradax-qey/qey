@@ -1,0 +1,447 @@
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <optional>
+#include <random>
+#include <string>
+
+#include "gtest/gtest.h"
+#include "qey/db.h"
+#include "qey/log.h"
+#include "qey/memory_file.h"
+
+namespace qey {
+namespace {
+
+using std::chrono::milliseconds;
+using std::chrono::seconds;
+
+// Opens databases over a MemFile, with fake clocks that tests control.
+class PersistTest : public testing::Test {
+ protected:
+  OpenOptions Options(SyncPolicy sync = SyncPolicy::kAlways,
+                      Recovery recovery = Recovery::kTruncate) {
+    OpenOptions o;
+    o.sync = sync;
+    o.recovery = recovery;
+    o.now = [this] { return steady_; };
+    o.wall_now = [this] { return wall_; };
+    return o;
+  }
+
+  StatusOr<std::unique_ptr<Db>> TryOpen(OpenOptions o) {
+    return Db::Open(std::make_unique<FileRef>(&file_), std::move(o));
+  }
+
+  std::unique_ptr<Db> Open(OpenOptions o) {
+    StatusOr<std::unique_ptr<Db>> r = TryOpen(std::move(o));
+    EXPECT_TRUE(r.ok()) << r.status().message();
+    return r.ok() ? *std::move(r) : nullptr;
+  }
+  std::unique_ptr<Db> Open() { return Open(Options()); }
+
+  void Advance(milliseconds d) {
+    steady_ += d;
+    wall_ += d;
+  }
+
+  // Simulates the process exiting and a new one starting after `downtime`:
+  // the monotonic clock starts over, wall-clock time keeps going.
+  void Restart(milliseconds downtime) {
+    steady_ = Db::Clock::time_point(milliseconds(5));
+    wall_ += downtime;
+  }
+
+  Db::Clock::time_point steady_ = Db::Clock::time_point(seconds(1000));
+  std::chrono::system_clock::time_point wall_ =
+      std::chrono::system_clock::time_point(seconds(1700000000));
+  MemFile file_;
+};
+
+TEST_F(PersistTest, NewFileGetsHeaderAndSync) {
+  auto db = Open();
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(file_.Size(), kLogHeaderSize);
+  EXPECT_EQ(file_.sync_count(), 1);
+  EXPECT_EQ(db->recovery_info().records_replayed, 0);
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 0);
+}
+
+TEST_F(PersistTest, ValuesSurviveReopen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    ASSERT_TRUE(db->Set("b", std::string("x\0y", 3)).ok());
+    ASSERT_TRUE(db->Set("a", "2").ok());
+    ASSERT_TRUE(db->Set("gone", "x").ok());
+    ASSERT_TRUE(*db->Del("gone"));
+  }
+  auto db = Open();
+  EXPECT_EQ(db->Get("a"), "2");
+  EXPECT_EQ(db->Get("b"), std::string("x\0y", 3));
+  EXPECT_EQ(db->Get("gone"), std::nullopt);
+  EXPECT_EQ(db->Size(), 2);
+  EXPECT_EQ(db->recovery_info().records_replayed, 5);
+}
+
+TEST_F(PersistTest, IncrSurvivesReopen) {
+  {
+    auto db = Open();
+    ASSERT_EQ(*db->Incr("n", 5), 5);
+    ASSERT_EQ(*db->Decr("n", 2), 3);
+  }
+  auto db = Open();
+  EXPECT_EQ(db->Get("n"), "3");
+  EXPECT_EQ(*db->Incr("n"), 4);
+}
+
+TEST_F(PersistTest, TtlCountsDownAcrossRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("k", "v", seconds(10)).ok());
+  }
+  Restart(seconds(4));
+  auto db = Open();
+  Db::TtlInfo ttl = db->GetTtl("k");
+  EXPECT_EQ(ttl.state, Db::TtlState::kExpiring);
+  EXPECT_EQ(ttl.remaining, seconds(6));
+  EXPECT_EQ(db->Get("k"), "v");
+
+  Advance(seconds(6));
+  EXPECT_EQ(db->Get("k"), std::nullopt);
+}
+
+TEST_F(PersistTest, KeysExpiredWhileClosedAreDroppedOnOpen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("short", "v", seconds(10)).ok());
+    ASSERT_TRUE(db->Set("long", "v", seconds(100)).ok());
+    ASSERT_TRUE(db->Set("forever", "v").ok());
+  }
+  Restart(seconds(50));
+  auto db = Open();
+  EXPECT_EQ(db->Size(), 2);
+  EXPECT_FALSE(db->Exists("short"));
+  EXPECT_TRUE(db->Exists("long"));
+  EXPECT_TRUE(db->Exists("forever"));
+}
+
+TEST_F(PersistTest, ExpirePersistAndOverwriteSurviveReopen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("expired", "v").ok());
+    ASSERT_TRUE(*db->Expire("expired", seconds(5)));
+    ASSERT_TRUE(db->Set("kept", "v", seconds(5)).ok());
+    ASSERT_TRUE(*db->Persist("kept"));
+    ASSERT_TRUE(db->Set("cleared", "v", seconds(5)).ok());
+    ASSERT_TRUE(db->Set("cleared", "w").ok());
+    ASSERT_TRUE(db->Set("now", "v").ok());
+    ASSERT_TRUE(*db->Expire("now", milliseconds(0)));
+  }
+  Restart(seconds(60));
+  auto db = Open();
+  EXPECT_FALSE(db->Exists("expired"));
+  EXPECT_EQ(db->GetTtl("kept").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db->GetTtl("cleared").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db->Get("cleared"), "w");
+  EXPECT_FALSE(db->Exists("now"));
+}
+
+TEST_F(PersistTest, IncrKeepsTtlAcrossReopen) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("n", "10", seconds(10)).ok());
+    ASSERT_EQ(*db->Incr("n"), 11);
+  }
+  Restart(seconds(3));
+  auto db = Open();
+  EXPECT_EQ(db->Get("n"), "11");
+  EXPECT_EQ(db->GetTtl("n").remaining, seconds(7));
+}
+
+TEST_F(PersistTest, OperationsThatChangeNothingWriteNothing) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("plain", "abc").ok());
+  ASSERT_TRUE(db->Set("short", "v", seconds(1)).ok());
+  Advance(seconds(2));
+  const uint64_t size = file_.Size();
+
+  EXPECT_FALSE(*db->Del("missing"));
+  EXPECT_FALSE(*db->Del("short"));  // already expired
+  EXPECT_FALSE(*db->Expire("missing", seconds(1)));
+  EXPECT_FALSE(*db->Persist("plain"));  // no TTL
+  EXPECT_FALSE(*db->Persist("missing"));
+  EXPECT_FALSE(db->Incr("plain").ok());  // not an integer
+  EXPECT_EQ(file_.Size(), size);
+}
+
+TEST_F(PersistTest, SyncPolicyAlwaysSyncsEveryWrite) {
+  auto db = Open();
+  const int base = file_.sync_count();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  EXPECT_EQ(file_.sync_count(), base + 2);
+  EXPECT_EQ(db->Get("a"), "1");  // reads never sync
+  EXPECT_EQ(file_.sync_count(), base + 2);
+}
+
+TEST_F(PersistTest, SyncPolicyManualSyncsOnlyWhenAsked) {
+  auto db = Open(Options(SyncPolicy::kManual));
+  const int base = file_.sync_count();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  EXPECT_EQ(file_.sync_count(), base);
+  ASSERT_TRUE(db->Sync().ok());
+  EXPECT_EQ(file_.sync_count(), base + 1);
+}
+
+TEST_F(PersistTest, InMemoryDbSyncIsNoOp) {
+  Db db;
+  EXPECT_TRUE(db.Sync().ok());
+  EXPECT_EQ(db.recovery_info().records_replayed, 0);
+}
+
+TEST_F(PersistTest, FailedAppendLeavesStoreAndFileUnchanged) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  const uint64_t size = file_.Size();
+
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->Set("b", "2").code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("b"), std::nullopt);
+  EXPECT_EQ(file_.Size(), size);  // the partial record was removed
+
+  file_.FailAppendsBeyond(std::nullopt);
+  ASSERT_TRUE(db->Set("b", "2").ok());
+  db.reset();
+  db = Open();
+  EXPECT_EQ(db->Get("a"), "1");
+  EXPECT_EQ(db->Get("b"), "2");
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 0);
+}
+
+TEST_F(PersistTest, FailedAppendDoesNotApplyIncrDelOrExpire) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("n", "1", seconds(10)).ok());
+  file_.FailAppendsBeyond(file_.Size());  // every further append fails
+
+  EXPECT_EQ(db->Incr("n").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Del("n").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Expire("n", seconds(99)).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Persist("n").status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("n"), "1");
+  EXPECT_EQ(db->GetTtl("n").remaining, seconds(10));
+}
+
+TEST_F(PersistTest, UnrepairableAppendFailureStopsWrites) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  const uint64_t size = file_.Size();
+
+  file_.FailAppendsBeyond(size + 3);
+  file_.FailTruncates(true);
+  EXPECT_EQ(db->Set("b", "2").code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size + 3);  // garbage left behind
+
+  // Even with the fault gone, the Db refuses to append after garbage.
+  file_.FailAppendsBeyond(std::nullopt);
+  file_.FailTruncates(false);
+  EXPECT_EQ(db->Set("c", "3").code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Sync().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("a"), "1");  // reads still work
+  db.reset();
+
+  // Reopening repairs the torn tail.
+  db = Open();
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 3);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_EQ(db->Get("a"), "1");
+  EXPECT_TRUE(db->Set("c", "3").ok());
+}
+
+TEST_F(PersistTest, SyncFailureStopsWritesAndLeavesMemoryUnchanged) {
+  auto db = Open();
+  ASSERT_TRUE(db->Set("a", "1").ok());
+
+  file_.FailSyncs(true);
+  EXPECT_EQ(db->Set("b", "2").code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("b"), std::nullopt);
+
+  file_.FailSyncs(false);
+  EXPECT_EQ(db->Set("c", "3").code(), StatusCode::kIoError);
+  EXPECT_EQ(db->Get("a"), "1");
+}
+
+TEST_F(PersistTest, OpenDropsTornTailAndRepairsFile) {
+  uint64_t good_size;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    ASSERT_TRUE(db->Set("b", "2").ok());
+    good_size = file_.Size();
+  }
+  file_.data().append("\x10\0\0\0\xaa", 5);  // half-written record
+
+  auto db = Open();
+  EXPECT_EQ(db->recovery_info().records_replayed, 2);
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 5);
+  EXPECT_EQ(file_.Size(), good_size);
+  EXPECT_EQ(db->Get("b"), "2");
+  ASSERT_TRUE(db->Set("c", "3").ok());
+  db.reset();
+
+  db = Open();  // the repaired log replays cleanly
+  EXPECT_EQ(db->recovery_info().dropped_bytes, 0);
+  EXPECT_EQ(db->Get("c"), "3");
+}
+
+TEST_F(PersistTest, StrictRecoveryRefusesTornTailAndLeavesFileAlone) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+  }
+  file_.data().append("junk", 4);
+  const std::string before = file_.data();
+
+  StatusOr<std::unique_ptr<Db>> r =
+      TryOpen(Options(SyncPolicy::kAlways, Recovery::kStrict));
+  ASSERT_FALSE(r.ok());
+  EXPECT_EQ(r.status().code(), StatusCode::kCorruption);
+  EXPECT_EQ(file_.data(), before);
+}
+
+TEST_F(PersistTest, TornHeaderIsRewritten) {
+  file_.data() = std::string("QEYDB\0", 6);  // header write cut short
+  auto db = Open();
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(file_.Size(), kLogHeaderSize);
+  ASSERT_TRUE(db->Set("a", "1").ok());
+  db.reset();
+  EXPECT_EQ(Open()->Get("a"), "1");
+}
+
+TEST_F(PersistTest, MidFileCorruptionFailsOpenWithoutModifyingFile) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->Set("a", "1").ok());
+    ASSERT_TRUE(db->Set("b", "2").ok());
+    ASSERT_TRUE(db->Set("c", "3").ok());
+  }
+  file_.data()[kLogHeaderSize + 10] ^= 0x01;  // inside the first record
+  const std::string before = file_.data();
+
+  StatusOr<std::unique_ptr<Db>> r = TryOpen(Options());
+  ASSERT_FALSE(r.ok());
+  EXPECT_EQ(r.status().code(), StatusCode::kCorruption);
+  EXPECT_EQ(file_.data(), before);
+}
+
+TEST_F(PersistTest, OpenRejectsForeignFileAndNullFile) {
+  file_.data() = "this is not a qey database file";
+  EXPECT_EQ(TryOpen(Options()).status().code(), StatusCode::kCorruption);
+  EXPECT_EQ(Db::Open(std::unique_ptr<File>()).status().code(),
+            StatusCode::kInvalidArgument);
+}
+
+// Runs random operations against a persistent Db and an in-memory Db in
+// lockstep, then checks that reopening the log reproduces the same state.
+TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
+  for (uint32_t seed = 1; seed <= 5; ++seed) {
+    file_ = MemFile();
+    steady_ = Db::Clock::time_point(seconds(1000));
+    wall_ = std::chrono::system_clock::time_point(seconds(1700000000));
+
+    std::mt19937 rng(seed);
+    auto pick = [&](int n) { return static_cast<int>(rng() % n); };
+    auto key = [&] { return "k" + std::to_string(pick(8)); };
+
+    auto persistent = Open();
+    Db reference([this] { return steady_; });
+    ASSERT_NE(persistent, nullptr);
+
+    for (int i = 0; i < 2000; ++i) {
+      const std::string k = key();
+      switch (pick(7)) {
+        case 0:
+          ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
+          ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
+          break;
+        case 1: {
+          const milliseconds ttl(pick(60) - 5);
+          const std::string v = std::to_string(pick(100));
+          ASSERT_TRUE(persistent->Set(k, v, ttl).ok());
+          ASSERT_TRUE(reference.Set(k, v, ttl).ok());
+          break;
+        }
+        case 2:
+          EXPECT_EQ(*persistent->Del(k), *reference.Del(k));
+          break;
+        case 3: {
+          const milliseconds ttl(pick(60) - 5);
+          EXPECT_EQ(*persistent->Expire(k, ttl), *reference.Expire(k, ttl));
+          break;
+        }
+        case 4:
+          EXPECT_EQ(*persistent->Persist(k), *reference.Persist(k));
+          break;
+        case 5: {
+          const int64_t delta = pick(21) - 10;
+          StatusOr<int64_t> a = persistent->Incr(k, delta);
+          StatusOr<int64_t> b = reference.Incr(k, delta);
+          ASSERT_EQ(a.ok(), b.ok());
+          if (a.ok()) EXPECT_EQ(*a, *b);
+          break;
+        }
+        case 6:
+          Advance(milliseconds(pick(20)));
+          break;
+      }
+    }
+
+    persistent.reset();
+    auto reopened = Open();  // same fake time: no restart
+    ASSERT_NE(reopened, nullptr);
+    for (int i = 0; i < 8; ++i) {
+      const std::string k = "k" + std::to_string(i);
+      EXPECT_EQ(reopened->Get(k), reference.Get(k))
+          << "seed=" << seed << " " << k;
+      Db::TtlInfo a = reopened->GetTtl(k);
+      Db::TtlInfo b = reference.GetTtl(k);
+      EXPECT_EQ(a.state, b.state) << "seed=" << seed << " " << k;
+      if (a.state == Db::TtlState::kExpiring) {
+        EXPECT_EQ(a.remaining, b.remaining) << "seed=" << seed << " " << k;
+      }
+    }
+  }
+}
+
+TEST(DbFileTest, OpensRealFileAndPersistsAcrossReopen) {
+  const std::string path = testing::TempDir() + "/db_file_test.qey";
+  std::remove(path.c_str());
+  {
+    StatusOr<std::unique_ptr<Db>> db = Db::Open(path);
+    ASSERT_TRUE(db.ok()) << db.status().message();
+    ASSERT_TRUE((*db)->Set("hello", "world").ok());
+    ASSERT_TRUE((*db)->Set("n", "41").ok());
+    ASSERT_EQ(*(*db)->Incr("n"), 42);
+    ASSERT_TRUE((*db)->Set("temp", "x", seconds(3600)).ok());
+  }
+  {
+    StatusOr<std::unique_ptr<Db>> db = Db::Open(path);
+    ASSERT_TRUE(db.ok()) << db.status().message();
+    EXPECT_EQ((*db)->Get("hello"), "world");
+    EXPECT_EQ((*db)->Get("n"), "42");
+    EXPECT_EQ((*db)->GetTtl("temp").state, Db::TtlState::kExpiring);
+    EXPECT_EQ((*db)->recovery_info().records_replayed, 4);
+  }
+  std::remove(path.c_str());
+}
+
+TEST(DbFileTest, OpenFailsOnDirectory) {
+  StatusOr<std::unique_ptr<Db>> db = Db::Open(testing::TempDir());
+  EXPECT_FALSE(db.ok());
+}
+
+}  // namespace
+}  // namespace qey

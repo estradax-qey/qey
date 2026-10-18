@@ -17,7 +17,12 @@ cc_library(
     name = "db",
     srcs = ["db.cc"],
     hdrs = ["db.h"],
-    deps = [":status"],
+    deps = [
+        ":file",
+        ":log",
+        ":posix_file",
+        ":status",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -80,6 +85,37 @@ cc_test(
     srcs = ["log_test.cc"],
     deps = [
         ":crc32",
+        ":log",
+        ":memory_file",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "posix_file",
+    srcs = ["posix_file.cc"],
+    hdrs = ["posix_file.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":file",
+        ":status",
+    ],
+)
+
+cc_test(
+    name = "posix_file_test",
+    srcs = ["posix_file_test.cc"],
+    deps = [
+        ":posix_file",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "db_persist_test",
+    srcs = ["db_persist_test.cc"],
+    deps = [
+        ":db",
         ":log",
         ":memory_file",
         "@googletest//:gtest_main",
