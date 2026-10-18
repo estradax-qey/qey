@@ -139,6 +139,7 @@ cc_test(
 
 cc_test(
     name = "db_persist_test",
+    size = "large",  # builds with sanitizers are many times slower
     srcs = ["db_persist_test.cc"],
     deps = [
         ":db",

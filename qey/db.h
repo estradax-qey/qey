@@ -60,6 +60,11 @@ struct OpenOptions {
   bool auto_compact = true;
   uint64_t compact_min_bytes = 4u << 20;
   uint32_t compact_ratio = 2;
+  // Compaction writes a collection in records of about this many bytes, so
+  // that none outgrows the log's record limit. There is rarely a reason to
+  // change it; tests do, to cover collections that span several records
+  // without building huge ones.
+  uint64_t compact_chunk_bytes = 1u << 20;
   // Clock overrides, for tests. Empty means the real clocks.
   std::function<std::chrono::steady_clock::time_point()> now;
   std::function<std::chrono::system_clock::time_point()> wall_now;

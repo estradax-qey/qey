@@ -1396,7 +1396,8 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
                              File& out) {
   constexpr size_t kFlushBytes = 1 << 20;
   // Collections are written in pieces so that no record outgrows the limit.
-  constexpr size_t kChunkBytes = 1 << 20;
+  const size_t chunk_bytes =
+      static_cast<size_t>(std::max<uint64_t>(options_.compact_chunk_bytes, 1));
 
   auto emit = [&](const Record& record) -> Status {
     Status s = EncodeRecord(record, buf);
@@ -1463,7 +1464,7 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
           chunk.scores.push_back(*score);
           bytes += 8;
         }
-        return bytes >= kChunkBytes ? flush() : Status::Ok();
+        return bytes >= chunk_bytes ? flush() : Status::Ok();
       };
       Status s = Status::Ok();
       switch (value.type()) {

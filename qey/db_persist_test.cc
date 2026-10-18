@@ -329,7 +329,9 @@ std::string Dump(Db& db, const std::string& key) {
 template <typename T>
 void ExpectSame(const StatusOr<T>& a, const StatusOr<T>& b) {
   EXPECT_EQ(a.status().code(), b.status().code());
-  if (a.ok() && b.ok()) EXPECT_EQ(*a, *b);
+  if (a.ok() && b.ok()) {
+    EXPECT_EQ(*a, *b);
+  }
 }
 
 TEST_F(PersistTest, BatchSurvivesReopenAsOneRecord) {
@@ -503,6 +505,12 @@ TEST_F(PersistTest, TtlsDoNotDriftWhenTheWallClockMovesBetweenReads) {
   EXPECT_EQ(db->GetTtl("n").remaining, seconds(40));
 }
 
+// Compaction in tiny pieces, so that a few hundred elements span many records.
+OpenOptions SmallChunks(OpenOptions o) {
+  o.compact_chunk_bytes = 2048;
+  return o;
+}
+
 TEST_F(PersistTest, HashesAndTheirTtlsSurviveRestart) {
   {
     auto db = Open();
@@ -551,14 +559,14 @@ TEST_F(PersistTest, ANewHashDoesNotInheritAStaleExpiredEntryAfterRestart) {
 }
 
 TEST_F(PersistTest, CompactionKeepsHashesInPiecesThatFitARecord) {
-  // About 3 MB of fields: more than one compaction chunk.
+  // Far more than one 2 KiB compaction chunk.
   std::vector<FieldValue> fields;
-  for (int i = 0; i < 30000; ++i) {
+  for (int i = 0; i < 600; ++i) {
     fields.emplace_back("field-" + std::to_string(100000 + i),
                         std::string(90, static_cast<char>('a' + i % 26)));
   }
   {
-    auto db = Open();
+    auto db = Open(SmallChunks(Options()));
     ASSERT_TRUE(db->HSet("big", fields).ok());
     ASSERT_TRUE(*db->Expire("big", seconds(500)));
     ASSERT_TRUE(db->HSet("small", "f", "v").ok());
@@ -567,12 +575,12 @@ TEST_F(PersistTest, CompactionKeepsHashesInPiecesThatFitARecord) {
   }
   Restart(seconds(100));
   auto db = Open();
-  EXPECT_EQ(*db->HLen("big"), 30000);
+  EXPECT_EQ(*db->HLen("big"), 600);
   EXPECT_EQ(*db->HGetAll("big"), fields);
   EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
   EXPECT_EQ(Dump(*db, "small"), "hash:f=v;");
-  // Several records, not one: the big hash was split.
-  EXPECT_GE(db->recovery_info().records_replayed, 4);
+  // Many records, not one: the big hash was split into 2 KiB pieces.
+  EXPECT_GE(db->recovery_info().records_replayed, 20);
 }
 
 TEST_F(PersistTest, HashBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
@@ -666,21 +674,21 @@ TEST_F(PersistTest, ANewListDoesNotInheritAStaleExpiredEntryAfterRestart) {
 
 TEST_F(PersistTest, CompactionKeepsABigListInOrderAndInPieces) {
   std::vector<std::string> elements;
-  for (int i = 0; i < 40000; ++i) {
+  for (int i = 0; i < 700; ++i) {
     elements.push_back(std::to_string(1000000 + i) + std::string(80, 'x'));
   }
   {
-    auto db = Open();
+    auto db = Open(SmallChunks(Options()));
     ASSERT_TRUE(db->RPush("big", elements).ok());
     ASSERT_TRUE(*db->Expire("big", seconds(500)));
     ASSERT_TRUE(db->Compact().ok());
   }
   Restart(seconds(100));
   auto db = Open();
-  EXPECT_EQ(*db->LLen("big"), 40000);
+  EXPECT_EQ(*db->LLen("big"), 700);
   EXPECT_EQ(*db->LRange("big", 0, -1), elements);
   EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
-  EXPECT_GE(db->recovery_info().records_replayed, 4);  // pieces, plus the TTL
+  EXPECT_GE(db->recovery_info().records_replayed, 20);  // pieces, plus the TTL
 }
 
 TEST_F(PersistTest, ListBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
@@ -764,21 +772,21 @@ TEST_F(PersistTest, ANewSetDoesNotInheritAStaleExpiredEntryAfterRestart) {
 
 TEST_F(PersistTest, CompactionKeepsABigSetInPieces) {
   std::vector<std::string> members;
-  for (int i = 0; i < 40000; ++i) {
+  for (int i = 0; i < 700; ++i) {
     members.push_back(std::to_string(1000000 + i) + std::string(80, 'm'));
   }
   {
-    auto db = Open();
+    auto db = Open(SmallChunks(Options()));
     ASSERT_TRUE(db->SAdd("big", members).ok());
     ASSERT_TRUE(*db->Expire("big", seconds(500)));
     ASSERT_TRUE(db->Compact().ok());
   }
   Restart(seconds(100));
   auto db = Open();
-  EXPECT_EQ(*db->SCard("big"), 40000);
+  EXPECT_EQ(*db->SCard("big"), 700);
   EXPECT_EQ(*db->SMembers("big"), members);  // already in byte order
   EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
-  EXPECT_GE(db->recovery_info().records_replayed, 4);
+  EXPECT_GE(db->recovery_info().records_replayed, 20);
 }
 
 TEST_F(PersistTest, SetBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
@@ -865,23 +873,23 @@ TEST_F(PersistTest, ANewSortedSetDoesNotInheritAStaleExpiredEntryAfterRestart) {
 
 TEST_F(PersistTest, CompactionKeepsABigSortedSetInPiecesWithItsScores) {
   std::vector<ScoredMember> members;
-  for (int i = 0; i < 30000; ++i) {
+  for (int i = 0; i < 600; ++i) {
     members.push_back(
         {"member-" + std::to_string(100000 + i) + std::string(70, 'z'),
          i * 0.25 - 1000});
   }
   {
-    auto db = Open();
+    auto db = Open(SmallChunks(Options()));
     ASSERT_TRUE(db->ZAdd("big", members).ok());
     ASSERT_TRUE(*db->Expire("big", seconds(500)));
     ASSERT_TRUE(db->Compact().ok());
   }
   Restart(seconds(100));
   auto db = Open();
-  EXPECT_EQ(*db->ZCard("big"), 30000);
+  EXPECT_EQ(*db->ZCard("big"), 600);
   EXPECT_EQ(*db->ZRange("big", 0, -1), members);  // scores rise with i
   EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
-  EXPECT_GE(db->recovery_info().records_replayed, 4);
+  EXPECT_GE(db->recovery_info().records_replayed, 20);
 }
 
 TEST_F(PersistTest, SortedSetBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
