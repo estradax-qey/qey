@@ -12,6 +12,8 @@ It is inspired by Redis/Valkey. Licensed under MIT.
 - Build everything: `bazel build //...`
 - Run all tests: `bazel test //...`
 - Language standard: C++20 (set in `.bazelrc`).
+- CI (`.github/workflows/ci.yml`) runs `bazel test //...` on Linux and macOS
+  for every push to `main` and every pull request.
 
 ## Code style
 
@@ -31,7 +33,16 @@ Key points:
   libraries, project headers; each group sorted.
 - Comment public APIs; don't restate what the code says.
 
-Format with `clang-format --style=Google`.
+Format with `clang-format` (the repo's `.clang-format` selects the Google
+style). A pre-commit hook in `.githooks/` rejects commits with unformatted
+C++ files. Enable it once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+If the hook reports files, run the `clang-format -i` command it prints and
+re-stage them. Do not bypass the hook with `--no-verify`.
 
 ## Commit messages
 

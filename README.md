@@ -1,5 +1,7 @@
 # qey
 
+[![CI](https://github.com/estradax/estradax-qey/actions/workflows/ci.yml/badge.svg)](https://github.com/estradax/estradax-qey/actions/workflows/ci.yml)
+
 An embedded, in-memory key-value store for C++, inspired by SQLite and Redis/Valkey.
 
 Status: early. The core works, but the API may still change.
@@ -31,6 +33,15 @@ and crash behavior.
 ```
 bazel build //...
 bazel test //...
+```
+
+## Contributing
+
+Follow [AGENTS.md](AGENTS.md): Google C++ style, Conventional Commits. Enable
+the format check that runs before each commit:
+
+```
+git config core.hooksPath .githooks
 ```
 
 ## License
