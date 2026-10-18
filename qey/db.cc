@@ -429,6 +429,102 @@ Status Db::LTrim(std::string_view key, int64_t start, int64_t stop) {
   return Run(op).status();
 }
 
+StatusOr<size_t> Db::SAdd(std::string_view key,
+                          const std::vector<std::string>& members) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kSAdd, key);
+  op.items = members;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<size_t> Db::SRem(std::string_view key,
+                          const std::vector<std::string>& members) {
+  WriteBatch::Op op = WriteBatch::MakeOp(WriteBatch::Op::Type::kSRem, key);
+  op.items = members;
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<bool> Db::SIsMember(std::string_view key, std::string_view member) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kSet, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return false;
+  const StringSet& set = it->second.value.set();
+  return set.find(member) != set.end();
+}
+
+StatusOr<size_t> Db::SCard(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kSet, &it);
+  if (!s.ok()) return s;
+  return it == map_.end() ? size_t{0} : it->second.value.set().size();
+}
+
+StatusOr<std::vector<std::string>> Db::SMembers(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kSet, &it);
+  if (!s.ok()) return s;
+  std::vector<std::string> members;
+  if (it != map_.end()) {
+    const StringSet& set = it->second.value.set();
+    members.assign(set.begin(), set.end());
+  }
+  return members;
+}
+
+StatusOr<std::vector<std::string>> Db::SUnion(
+    const std::vector<std::string>& keys) {
+  return CombineSets(keys, 'u');
+}
+
+StatusOr<std::vector<std::string>> Db::SInter(
+    const std::vector<std::string>& keys) {
+  return CombineSets(keys, 'i');
+}
+
+StatusOr<std::vector<std::string>> Db::SDiff(
+    const std::vector<std::string>& keys) {
+  return CombineSets(keys, 'd');
+}
+
+StatusOr<std::vector<std::string>> Db::CombineSets(
+    const std::vector<std::string>& keys, char op) {
+  std::lock_guard<std::mutex> lock(mu_);
+  // Look at every key first, so that a key of the wrong type fails the call
+  // whatever the others hold.
+  std::vector<const StringSet*> sets;
+  sets.reserve(keys.size());
+  static const StringSet kEmpty;
+  for (const std::string& key : keys) {
+    Map::iterator it;
+    Status s = FindOfType(key, KeyType::kSet, &it);
+    if (!s.ok()) return s;
+    sets.push_back(it == map_.end() ? &kEmpty : &it->second.value.set());
+  }
+  StringSet result;
+  if (!sets.empty()) {
+    if (op == 'u') {
+      for (const StringSet* set : sets) result.insert(set->begin(), set->end());
+    } else {
+      for (const std::string& member : *sets[0]) {
+        bool keep = true;
+        for (size_t i = 1; i < sets.size() && keep; ++i) {
+          const bool in_other = sets[i]->find(member) != sets[i]->end();
+          keep = op == 'i' ? in_other : !in_other;
+        }
+        if (keep) result.insert(member);
+      }
+    }
+  }
+  return std::vector<std::string>(result.begin(), result.end());
+}
+
 size_t Db::Sweep(size_t limit) {
   std::lock_guard<std::mutex> lock(mu_);
   const Clock::time_point now = now_();
@@ -720,6 +816,48 @@ Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
         r.n1 = 0;  // keeps nothing
         r.n2 = -1;
       }
+      *record = std::move(r);
+      break;
+    }
+    case Type::kSAdd: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kSet, &it);
+      if (!s.ok()) return s;
+      const StringSet* set =
+          it == map_.end() ? nullptr : &it->second.value.set();
+      std::set<std::string_view> seen;
+      Record r;
+      r.type = Record::Type::kSAdd;
+      r.key = op.key;
+      for (const std::string& member : op.items) {
+        if ((set == nullptr || set->find(member) == set->end()) &&
+            seen.insert(member).second) {
+          r.items.push_back(member);
+        }
+      }
+      if (r.items.empty()) break;  // everything was already there
+      result->count = r.items.size();
+      r.n1 = it == map_.end() ? 1 : 0;
+      *record = std::move(r);
+      break;
+    }
+    case Type::kSRem: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kSet, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const StringSet& set = it->second.value.set();
+      std::set<std::string_view> seen;
+      Record r;
+      r.type = Record::Type::kSRem;
+      r.key = op.key;
+      for (const std::string& member : op.items) {
+        if (set.find(member) != set.end() && seen.insert(member).second) {
+          r.items.push_back(member);
+        }
+      }
+      if (r.items.empty()) break;
+      result->count = r.items.size();
       *record = std::move(r);
       break;
     }
@@ -1078,10 +1216,13 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
       return emit(record);
     }
     case KeyType::kHash:
-    case KeyType::kList: {
+    case KeyType::kList:
+    case KeyType::kSet: {
       const bool is_hash = value.type() == KeyType::kHash;
       Record chunk;
-      chunk.type = is_hash ? Record::Type::kHSet : Record::Type::kRPush;
+      chunk.type = is_hash                         ? Record::Type::kHSet
+                   : value.type() == KeyType::kSet ? Record::Type::kSAdd
+                                                   : Record::Type::kRPush;
       chunk.key = key;
       chunk.n1 = 1;  // the first chunk starts the value; later ones add to it
       size_t bytes = 0;
@@ -1107,6 +1248,11 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
       if (is_hash) {
         for (const auto& [field, field_value] : value.hash()) {
           Status s = add(field, &field_value);
+          if (!s.ok()) return s;
+        }
+      } else if (value.type() == KeyType::kSet) {
+        for (const std::string& member : value.set()) {
+          Status s = add(member, nullptr);
           if (!s.ok()) return s;
         }
       } else {
@@ -1257,6 +1403,28 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
                  list.end());
       list.erase(list.begin(),
                  list.begin() + static_cast<std::ptrdiff_t>(record.n1));
+      break;
+    }
+    case Record::Type::kSAdd: {
+      Map::iterator it;
+      if (record.n1 == 1) {
+        it = InsertLocked(record.key);
+        ClearExpiryLocked(it);
+        it->second.value = Value::Make(KeyType::kSet);
+      } else {
+        it = CollectionLocked(record.key, KeyType::kSet, /*create=*/true);
+        if (it == map_.end()) break;
+      }
+      StringSet& set = it->second.value.set();
+      for (std::string& member : record.items) set.insert(std::move(member));
+      break;
+    }
+    case Record::Type::kSRem: {
+      auto it = CollectionLocked(record.key, KeyType::kSet, /*create=*/false);
+      if (it == map_.end()) break;
+      StringSet& set = it->second.value.set();
+      for (const std::string& member : record.items) set.erase(member);
+      if (set.empty()) EraseLocked(it);
       break;
     }
     case Record::Type::kReplace: {

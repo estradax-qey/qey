@@ -1167,6 +1167,144 @@ TEST_F(DbTest, AFailedBatchPutsAListBackAsItWas) {
   EXPECT_EQ(db_.Keys(), (Keys{"l", "text"}));
 }
 
+TEST_F(DbTest, SetAddCountsOnlyNewMembers) {
+  EXPECT_EQ(*db_.SAdd("s", {"b", "a", "b"}), 2);  // "b" twice counts once
+  EXPECT_EQ(*db_.SAdd("s", {"a", "c"}), 1);
+  EXPECT_EQ(*db_.SAdd("s", {"a"}), 0);
+  EXPECT_EQ(*db_.SAdd("s", Strings{}), 0);
+  EXPECT_EQ(*db_.SMembers("s"), (Strings{"a", "b", "c"}));  // byte order
+  EXPECT_EQ(*db_.SCard("s"), 3);
+  EXPECT_EQ(db_.Type("s"), KeyType::kSet);
+  EXPECT_EQ(*db_.SAdd("fresh", Strings{}), 0);
+  EXPECT_FALSE(db_.Exists("fresh"));
+}
+
+TEST_F(DbTest, SetMembersMayBeEmptyAndHoldAnyBytes) {
+  ASSERT_TRUE(db_.SAdd("s", {"", std::string("\0x", 2), "z"}).ok());
+  EXPECT_TRUE(*db_.SIsMember("s", ""));
+  EXPECT_TRUE(*db_.SIsMember("s", std::string("\0x", 2)));
+  EXPECT_FALSE(*db_.SIsMember("s", std::string("\0", 1)));
+  EXPECT_EQ(db_.SMembers("s")->front(), "");
+}
+
+TEST_F(DbTest, MissingSetsReadAsEmpty) {
+  EXPECT_FALSE(*db_.SIsMember("nope", "a"));
+  EXPECT_EQ(*db_.SCard("nope"), 0);
+  EXPECT_EQ(*db_.SMembers("nope"), Strings{});
+  EXPECT_EQ(*db_.SRem("nope", {"a"}), 0);
+}
+
+TEST_F(DbTest, SetRemoveCountsDistinctPresentMembersAndRemovesAnEmptiedKey) {
+  ASSERT_TRUE(db_.SAdd("s", {"a", "b", "c"}).ok());
+  EXPECT_EQ(*db_.SRem("s", {"a", "a", "nope"}), 1);
+  EXPECT_EQ(*db_.SRem("s", {"nope"}), 0);
+  EXPECT_EQ(*db_.SRem("s", Strings{}), 0);
+  EXPECT_EQ(*db_.SMembers("s"), (Strings{"b", "c"}));
+  EXPECT_EQ(*db_.SRem("s", {"b", "c"}), 2);
+  EXPECT_EQ(db_.Type("s"), KeyType::kNone);
+  EXPECT_EQ(db_.Keys(), Keys{});
+}
+
+TEST_F(DbTest, SetAlgebraOverSeveralSets) {
+  ASSERT_TRUE(db_.SAdd("a", {"1", "2", "3", "4"}).ok());
+  ASSERT_TRUE(db_.SAdd("b", {"3", "4", "5"}).ok());
+  ASSERT_TRUE(db_.SAdd("c", {"4", "5", "6"}).ok());
+  EXPECT_EQ(*db_.SUnion({"a", "b", "c"}),
+            (Strings{"1", "2", "3", "4", "5", "6"}));
+  EXPECT_EQ(*db_.SInter({"a", "b", "c"}), Strings{"4"});
+  EXPECT_EQ(*db_.SInter({"a", "b"}), (Strings{"3", "4"}));
+  EXPECT_EQ(*db_.SDiff({"a", "b", "c"}), (Strings{"1", "2"}));
+  EXPECT_EQ(*db_.SDiff({"b", "a"}), Strings{"5"});
+  EXPECT_EQ(*db_.SUnion({"a"}), (Strings{"1", "2", "3", "4"}));
+  EXPECT_EQ(*db_.SInter({"a", "a"}), (Strings{"1", "2", "3", "4"}));
+}
+
+TEST_F(DbTest, SetAlgebraTreatsMissingKeysAsEmptyAndNoKeysAsNothing) {
+  ASSERT_TRUE(db_.SAdd("a", {"1", "2"}).ok());
+  EXPECT_EQ(*db_.SUnion({"a", "nope"}), (Strings{"1", "2"}));
+  EXPECT_EQ(*db_.SInter({"a", "nope"}), Strings{});
+  EXPECT_EQ(*db_.SDiff({"a", "nope"}), (Strings{"1", "2"}));
+  EXPECT_EQ(*db_.SDiff({"nope", "a"}), Strings{});
+  EXPECT_EQ(*db_.SUnion(Strings{}), Strings{});
+  EXPECT_EQ(*db_.SInter(Strings{}), Strings{});
+  EXPECT_EQ(*db_.SDiff(Strings{}), Strings{});
+}
+
+TEST_F(DbTest, SetAlgebraFailsIfAnyKeyIsNotASetWhateverTheOthersHold) {
+  ASSERT_TRUE(db_.SAdd("a", {"1"}).ok());
+  Set("s", "string");
+  ASSERT_TRUE(db_.RPush("l", {"x"}).ok());
+  EXPECT_EQ(db_.SUnion({"a", "s"}).status().code(), StatusCode::kWrongType);
+  EXPECT_EQ(db_.SInter({"nope", "s"}).status().code(), StatusCode::kWrongType);
+  EXPECT_EQ(db_.SDiff({"a", "nope", "l"}).status().code(),
+            StatusCode::kWrongType);
+}
+
+TEST_F(DbTest, SetCommandsCheckTheTypeOfTheKey) {
+  Set("s", "string");
+  ASSERT_TRUE(db_.SAdd("set", {"a"}).ok());
+  const StatusCode wrong = StatusCode::kWrongType;
+  EXPECT_EQ(db_.SAdd("s", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.SRem("s", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.SIsMember("s", "a").status().code(), wrong);
+  EXPECT_EQ(db_.SCard("s").status().code(), wrong);
+  EXPECT_EQ(db_.SMembers("s").status().code(), wrong);
+  EXPECT_EQ(db_.Get("s"), "string");
+
+  EXPECT_EQ(db_.HSet("set", "f", "v").status().code(), wrong);
+  EXPECT_EQ(db_.RPush("set", {"a"}).status().code(), wrong);
+  EXPECT_EQ(db_.Append("set", "x").status().code(), wrong);
+  EXPECT_EQ(db_.Get("set"), std::nullopt);
+  EXPECT_EQ(*db_.SMembers("set"), Strings{"a"});  // untouched
+}
+
+TEST_F(DbTest, SetsExpireRenameAndAreReplacedLikeAnyKey) {
+  ASSERT_TRUE(db_.SAdd("a", {"x", "y"}).ok());
+  ASSERT_TRUE(*db_.Expire("a", milliseconds(100)));
+  ASSERT_TRUE(*db_.Rename("a", "b"));
+  EXPECT_EQ(*db_.SMembers("b"), (Strings{"x", "y"}));
+  EXPECT_EQ(db_.GetTtl("b").remaining, milliseconds(100));
+  Advance(milliseconds(100));
+  EXPECT_EQ(db_.Type("b"), KeyType::kNone);
+  EXPECT_EQ(*db_.SAdd("b", {"fresh"}), 1);
+  EXPECT_EQ(*db_.SMembers("b"), Strings{"fresh"});
+  EXPECT_EQ(db_.GetTtl("b").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(DbTest, OversizedSetMembersAreRejected) {
+  std::string big(Db::kMaxValueSize + 1, 'x');
+  EXPECT_EQ(db_.SAdd("s", {"ok", big}).status().code(),
+            StatusCode::kInvalidArgument);
+  EXPECT_FALSE(db_.Exists("s"));
+}
+
+TEST_F(DbTest, SetsInABatchAndARolledBackBatch) {
+  ASSERT_TRUE(db_.SAdd("s", {"a", "b", "c"}).ok());
+  ASSERT_TRUE(*db_.Expire("s", milliseconds(100)));
+  Set("text", "abc");
+  ASSERT_EQ(db_.Keys().size(), 2);
+
+  WriteBatch ok_batch;
+  ok_batch.SAdd("s", {"d"})
+      .SRem("s", {"a"})
+      .SAdd("t", {"x", "y"})
+      .SRem("t", {"x"});
+  ASSERT_TRUE(db_.Write(ok_batch).ok());
+  EXPECT_EQ(*db_.SMembers("s"), (Strings{"b", "c", "d"}));
+  EXPECT_EQ(*db_.SMembers("t"), Strings{"y"});
+
+  WriteBatch bad_batch;
+  bad_batch.SAdd("s", {"zzz"})
+      .SRem("s", {"b", "c"})
+      .SAdd("u", {"n"})
+      .Incr("text");
+  EXPECT_EQ(db_.Write(bad_batch).code(), StatusCode::kNotInteger);
+  EXPECT_EQ(*db_.SMembers("s"), (Strings{"b", "c", "d"}));
+  EXPECT_EQ(db_.GetTtl("s").remaining, milliseconds(100));
+  EXPECT_EQ(db_.Type("u"), KeyType::kNone);
+  EXPECT_EQ(db_.Keys(), (Keys{"s", "t", "text"}));
+}
+
 TEST_F(DbTest, DefaultClockConstructs) {
   Db db;
   ASSERT_TRUE(db.Set("k", "v", milliseconds(60000)).ok());

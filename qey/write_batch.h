@@ -131,6 +131,20 @@ class WriteBatch {
     return Add(std::move(op));
   }
 
+  // Sets. The same as Db::SAdd() and Db::SRem().
+  WriteBatch& SAdd(std::string_view key,
+                   const std::vector<std::string>& members) {
+    Op op = MakeOp(Op::Type::kSAdd, key);
+    op.items = members;
+    return Add(std::move(op));
+  }
+  WriteBatch& SRem(std::string_view key,
+                   const std::vector<std::string>& members) {
+    Op op = MakeOp(Op::Type::kSRem, key);
+    op.items = members;
+    return Add(std::move(op));
+  }
+
   // Removes all changes from the batch.
   void Clear() { ops_.clear(); }
 
@@ -161,6 +175,8 @@ class WriteBatch {
       kRPop,
       kLSet,
       kLTrim,
+      kSAdd,
+      kSRem,
     };
 
     Type type = Type::kSet;
@@ -169,7 +185,7 @@ class WriteBatch {
     std::string arg;
     std::optional<std::chrono::milliseconds> ttl;  // kSet, kExpire.
     // kHSet: fields and values, alternating. kHDel: the fields. kLPush and
-    // kRPush: the values.
+    // kRPush: the values. kSAdd and kSRem: the members.
     std::vector<std::string> items;
     // kIncr, kDecr, kHIncr: the delta. kLPop, kRPop: how many. kLSet: the
     // index. kLTrim: the first index to keep.

@@ -285,6 +285,40 @@ class Db {
   // LRange(). Keeping none removes the key. A missing key is not an error.
   Status LTrim(std::string_view key, int64_t start, int64_t stop);
 
+  // ---- Sets ----
+  //
+  // A set is a collection of distinct strings, kept in byte order. Removing
+  // the last member removes the key. These fail with kWrongType if a key holds
+  // something other than a set, and with kInvalidArgument if a key or member
+  // exceeds its size limit.
+
+  // Adds members. Returns how many were not already there.
+  StatusOr<size_t> SAdd(std::string_view key,
+                        const std::vector<std::string>& members);
+
+  // Removes members. Returns how many were there.
+  StatusOr<size_t> SRem(std::string_view key,
+                        const std::vector<std::string>& members);
+
+  StatusOr<bool> SIsMember(std::string_view key, std::string_view member);
+
+  // The number of members; 0 for a missing key.
+  StatusOr<size_t> SCard(std::string_view key);
+
+  // All members, in byte order; empty for a missing key.
+  StatusOr<std::vector<std::string>> SMembers(std::string_view key);
+
+  // The union, intersection, or difference of the sets at `keys`, in byte
+  // order. A missing key counts as an empty set. SDiff() returns the members
+  // of the first set that are in none of the others. All are read at one
+  // instant, and all fail with kWrongType if any of the keys is not a set.
+  StatusOr<std::vector<std::string>> SUnion(
+      const std::vector<std::string>& keys);
+  StatusOr<std::vector<std::string>> SInter(
+      const std::vector<std::string>& keys);
+  StatusOr<std::vector<std::string>> SDiff(
+      const std::vector<std::string>& keys);
+
   // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
   // byte order, starting after `after` (or from the beginning if empty).
   // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
@@ -460,6 +494,10 @@ class Db {
   // `mu_` held.
   Map::iterator CollectionLocked(std::string_view key, KeyType type,
                                  bool create);
+
+  // Reads the sets at `keys` and combines them; `op` is 'u', 'i' or 'd'.
+  StatusOr<std::vector<std::string>> CombineSets(
+      const std::vector<std::string>& keys, char op);
 
   // Appends the records that recreate one entry to `buf`, writing `buf` out
   // to `out` whenever it grows large. For compaction.

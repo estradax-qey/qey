@@ -303,6 +303,12 @@ std::string Dump(Db& db, const std::string& key) {
       for (const std::string& element : *all) out += element + ",";
       return out;
     }
+    case KeyType::kSet: {
+      std::string out = "set:";
+      StatusOr<std::vector<std::string>> all = db.SMembers(key);
+      for (const std::string& member : *all) out += member + ",";
+      return out;
+    }
     default:
       return "?";
   }
@@ -707,6 +713,99 @@ TEST_F(PersistTest, FailedListWritesAreUndone) {
   EXPECT_EQ(db->LTrim("l", 0, 0).code(), StatusCode::kIoError);
   EXPECT_EQ(file_.Size(), size);
   EXPECT_EQ(Dump(*db, "l"), "list:a,b,");
+}
+
+TEST_F(PersistTest, SetsAndTheirTtlsSurviveRestart) {
+  {
+    auto db = Open();
+    ASSERT_EQ(*db->SAdd("s", {"c", "a", "b", "a"}), 3);
+    ASSERT_EQ(*db->SRem("s", {"b", "nope"}), 1);
+    ASSERT_EQ(*db->SAdd("s", {"d"}), 1);
+    ASSERT_TRUE(*db->Expire("s", seconds(100)));
+    ASSERT_EQ(*db->SAdd("gone", {"x"}), 1);
+    ASSERT_EQ(*db->SRem("gone", {"x"}), 1);  // empties the set: key removed
+  }
+  Restart(seconds(30));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "s"), "set:a,c,d,");
+  EXPECT_EQ(db->GetTtl("s").remaining, seconds(70));
+  EXPECT_EQ(db->Type("gone"), KeyType::kNone);
+}
+
+TEST_F(PersistTest, ANewSetDoesNotInheritAStaleExpiredEntryAfterRestart) {
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->SAdd("a", {"old1", "old2"}).ok());
+    ASSERT_TRUE(*db->Expire("a", seconds(10)));
+    ASSERT_TRUE(db->RPush("b", {"x"}).ok());
+    ASSERT_TRUE(*db->Expire("b", seconds(10)));
+    Advance(seconds(10));  // both expire, unnoticed
+
+    ASSERT_EQ(*db->SAdd("a", {"new"}), 1);
+    ASSERT_EQ(*db->SAdd("b", {"y"}), 1);  // was a list
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "a"), "set:new,");
+  EXPECT_EQ(Dump(*db, "b"), "set:y,");
+  EXPECT_EQ(db->GetTtl("a").state, Db::TtlState::kNoExpiry);
+  EXPECT_EQ(db->GetTtl("b").state, Db::TtlState::kNoExpiry);
+}
+
+TEST_F(PersistTest, CompactionKeepsABigSetInPieces) {
+  std::vector<std::string> members;
+  for (int i = 0; i < 40000; ++i) {
+    members.push_back(std::to_string(1000000 + i) + std::string(80, 'm'));
+  }
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->SAdd("big", members).ok());
+    ASSERT_TRUE(*db->Expire("big", seconds(500)));
+    ASSERT_TRUE(db->Compact().ok());
+  }
+  Restart(seconds(100));
+  auto db = Open();
+  EXPECT_EQ(*db->SCard("big"), 40000);
+  EXPECT_EQ(*db->SMembers("big"), members);  // already in byte order
+  EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
+  EXPECT_GE(db->recovery_info().records_replayed, 4);
+}
+
+TEST_F(PersistTest, SetBatchesAreAllOrNothingWhateverByteACrashStopsAt) {
+  uint64_t before;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->SAdd("s", {"a", "b"}).ok());
+    before = file_.Size();
+    WriteBatch batch;
+    batch.SAdd("s", {"c"}).SRem("s", {"a"}).SAdd("t", {"x", "y"});
+    ASSERT_TRUE(db->Write(batch).ok());
+  }
+  const std::string full = file_.data();
+  for (uint64_t cut = before; cut <= full.size(); ++cut) {
+    MemFile crashed(full.substr(0, cut));
+    StatusOr<std::unique_ptr<Db>> db =
+        Db::Open(std::make_unique<MemStorage>(&crashed), Options());
+    ASSERT_TRUE(db.ok()) << "cut=" << cut;
+    if (cut < full.size()) {
+      EXPECT_EQ(Dump(**db, "s"), "set:a,b,") << "cut=" << cut;
+      EXPECT_EQ(Dump(**db, "t"), "none") << "cut=" << cut;
+    } else {
+      EXPECT_EQ(Dump(**db, "s"), "set:b,c,");
+      EXPECT_EQ(Dump(**db, "t"), "set:x,y,");
+    }
+  }
+}
+
+TEST_F(PersistTest, FailedSetWritesAreUndone) {
+  auto db = Open();
+  ASSERT_TRUE(db->SAdd("s", {"a", "b"}).ok());
+  const uint64_t size = file_.Size();
+  file_.FailAppendsBeyond(size + 3);
+  EXPECT_EQ(db->SAdd("s", {"c"}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(db->SRem("s", {"a"}).status().code(), StatusCode::kIoError);
+  EXPECT_EQ(file_.Size(), size);
+  EXPECT_EQ(Dump(*db, "s"), "set:a,b,");
 }
 
 TEST_F(PersistTest, MaxTtlSurvivesReopen) {
@@ -1182,7 +1281,7 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(15)) {
+      switch (pick(16)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -1240,6 +1339,39 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 15: {
+          const std::string m = std::to_string(pick(6));
+          switch (pick(6)) {
+            case 0:
+              ExpectSame(persistent->SAdd(k, {m, m + "b"}),
+                         reference.SAdd(k, {m, m + "b"}));
+              break;
+            case 1:
+              ExpectSame(persistent->SRem(k, {m, "1"}),
+                         reference.SRem(k, {m, "1"}));
+              break;
+            case 2:
+              ExpectSame(persistent->SIsMember(k, m),
+                         reference.SIsMember(k, m));
+              break;
+            case 3:
+              ExpectSame(persistent->SMembers(k), reference.SMembers(k));
+              break;
+            case 4: {
+              const std::string k2 = key();
+              ExpectSame(persistent->SUnion({k, k2}),
+                         reference.SUnion({k, k2}));
+              ExpectSame(persistent->SInter({k, k2}),
+                         reference.SInter({k, k2}));
+              ExpectSame(persistent->SDiff({k, k2}), reference.SDiff({k, k2}));
+              break;
+            }
+            case 5:
+              ExpectSame(persistent->SCard(k), reference.SCard(k));
+              break;
+          }
+          break;
+        }
         case 14: {
           const std::string v = std::to_string(pick(50));
           switch (pick(8)) {
@@ -1311,7 +1443,13 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           const int n = 1 + pick(4);
           for (int j = 0; j < n; ++j) {
             const std::string bk = key();
-            switch (pick(14)) {
+            switch (pick(16)) {
+              case 14:
+                batch.SAdd(bk, {std::to_string(pick(6))});
+                break;
+              case 15:
+                batch.SRem(bk, {std::to_string(pick(6))});
+                break;
               case 11:
                 batch.RPush(bk, {std::to_string(pick(50))});
                 break;
