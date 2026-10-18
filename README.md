@@ -22,6 +22,14 @@ std::optional<std::string> v = (*db)->Get("greeting");
 (*db)->Append("log", "more text");
 (*db)->Rename("old-name", "new-name");
 
+// Hashes, lists, sets and sorted sets, with Redis semantics.
+(*db)->HSet("user:1", {{"name", "Ann"}, {"city", "Oslo"}});
+(*db)->RPush("queue", {"job-1", "job-2"});
+auto next = (*db)->LPop("queue");                       // {"job-1"}
+(*db)->SAdd("tags:1", {"red", "blue"});
+(*db)->ZAdd("scores", {{"ann", 91.5}, {"bo", 78}});
+auto top = (*db)->ZRange("scores", -3, -1);             // highest three
+
 // Several changes as one unit: all of them or none, even across a crash.
 qey::WriteBatch batch;
 batch.Decr("stock:widget", 2).Incr("sold:widget", 2).Set("order:42", "paid");
@@ -40,6 +48,13 @@ do {
 
 The log compacts itself as it grows, and the file is locked while open, so a
 second `Open` of the same path fails with `kUnavailable`.
+
+A key holds one type. Using a command for another type returns `kWrongType`
+(`Get` returns nothing for a key that is not a string; `Type(key)` tells you
+which it is), `Set` replaces whatever was there, and `Del`, `Expire`, `Rename`
+and `Keys` work on every type. A collection that becomes empty disappears.
+Everything above, including all the collection commands, can be part of a
+`WriteBatch`.
 
 By default every write is synced to disk before it returns. For higher write
 throughput, `SyncPolicy::kInterval` syncs once per second instead, trading up

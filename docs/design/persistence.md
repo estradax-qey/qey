@@ -53,6 +53,19 @@ record := length:u32  crc32:u32  type:u8  payload[length - 1]
 | 5    | APPEND  | key, suffix                      |
 | 6    | RENAME  | key (source), new key            |
 | 7    | BATCH   | count:u32, then count x (length:u32, body) |
+| 8    | REPLACE | key, value (the TTL is kept)     |
+| 9    | HSET    | key, fresh, field/value strings  |
+| 10   | HDEL    | key, field strings               |
+| 11   | LPUSH   | key, fresh, value strings        |
+| 12   | RPUSH   | key, fresh, value strings        |
+| 13   | LPOP    | key, count:i64                   |
+| 14   | RPOP    | key, count:i64                   |
+| 15   | LSET    | key, value string, index:i64     |
+| 16   | LTRIM   | key, first:i64, last:i64         |
+| 17   | SADD    | key, fresh, member strings       |
+| 18   | SREM    | key, member strings              |
+| 19   | ZADD    | key, fresh, member strings, one score:f64 each |
+| 20   | ZREM    | key, member strings              |
 
 A BATCH holds other records (any type except BATCH) as members. The members
 share the BATCH's checksum, so the log has all of them or none: a crash that
@@ -76,6 +89,33 @@ intermediate states because the whole thing runs under the store's lock.
 atomic mechanism as compaction, so the file shrinks immediately.
 Lazy expiry and `Sweep()` are **not** logged: expiry is derived from the
 stored absolute times, and keys already expired at replay are skipped.
+
+### Collections
+
+Types 9 to 20 change lists, hashes, sets and sorted sets. They share one
+layout, described by a single table in the code: after the key come an
+optional *fresh* byte, an optional list of strings (`count:u32` and then that
+many length-prefixed strings), an optional list of scores (8-byte IEEE-754 bit
+patterns, one for each string), and up to two `i64`. The same rules validate a
+record when it is written and when it is read, including that a field the
+layout does not use must be zero or empty.
+
+**Only effective changes are logged**, resolved against the state at the time:
+a `LTRIM` carries absolute positions, never negative ones; a `LPOP` carries how
+many elements it really removed; `SADD` lists only the members that were new,
+`HDEL` only the fields that were there; a `HINCR`, `ZINCR` or `Incr` logs the
+resulting value, never the delta. So replay does no interpretation and cannot
+disagree with what happened.
+
+**The fresh flag.** A key can expire in memory without anything being logged,
+so the log may still hold the old entry and its deadline. When a change
+*creates* a collection under such a name, its record has `fresh = 1`, which
+tells replay to start from an empty collection with no TTL and discard
+whatever is there. Without it, replay would merge into, or be refused by, an
+entry the live store had already forgotten. (For strings the same job is done
+by logging `SET`, which replaces everything.)
+
+A collection that becomes empty is removed, in memory and when replayed.
 
 Unknown record types make `Open` fail with `kCorruption` rather than being
 skipped, so a newer file is never silently misread by an older reader.
@@ -151,8 +191,11 @@ trigger off.
 
 Compaction is done by `Storage::Replace()`; `PosixStorage` implements it as:
 
-1. Write header + one `SET` per live key to `<path>.tmp` (records are batched
-   into ~1 MiB appends), skipping keys that have expired.
+1. Write header + the records that recreate each live key to `<path>.tmp`
+   (records are batched into ~1 MiB appends), skipping keys that have
+   expired. A string is one `SET` with its deadline; a collection is written
+   in pieces of about 1 MiB (the first with `fresh = 1`) followed by an
+   `EXPIRE` if it has a TTL, so a collection of any size fits the record limit.
 2. `fsync` the temp file, then `rename` it over `<path>`.
 3. `fsync` the containing directory.
 
