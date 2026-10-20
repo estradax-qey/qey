@@ -1,3 +1,0 @@
-# qey needs C++20.
-build --cxxopt=-std=c++20
-build --host_cxxopt=-std=c++20
