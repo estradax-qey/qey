@@ -145,6 +145,8 @@ std::string_view TypeName(KeyType type) {
       return "set";
     case KeyType::kZSet:
       return "zset";
+    case KeyType::kStream:
+      return "stream";
   }
   return "none";
 }

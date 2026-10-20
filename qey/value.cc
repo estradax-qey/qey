@@ -1,8 +1,12 @@
 #include "qey/value.h"
 
+#include <charconv>
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace qey {
@@ -30,6 +34,40 @@ bool ZSet::Remove(std::string_view member) {
   return true;
 }
 
+StreamId StreamId::Next() const {
+  if (seq < kMaxStreamIdPart) return {ms, seq + 1};
+  if (ms < kMaxStreamIdPart) return {ms + 1, 0};
+  return *this;
+}
+
+std::string StreamId::ToString() const {
+  return std::to_string(ms) + "-" + std::to_string(seq);
+}
+
+namespace {
+
+// Reads a whole string of digits as a number no larger than kMaxStreamIdPart.
+bool ParseIdPart(std::string_view text, uint64_t* out) {
+  if (text.empty() || text.front() < '0' || text.front() > '9') return false;
+  auto [ptr, ec] =
+      std::from_chars(text.data(), text.data() + text.size(), *out);
+  return ec == std::errc() && ptr == text.data() + text.size() &&
+         *out <= kMaxStreamIdPart;
+}
+
+}  // namespace
+
+std::optional<StreamId> StreamId::Parse(std::string_view text) {
+  StreamId id;
+  const size_t dash = text.find('-');
+  if (!ParseIdPart(text.substr(0, dash), &id.ms)) return std::nullopt;
+  if (dash != std::string_view::npos &&
+      !ParseIdPart(text.substr(dash + 1), &id.seq)) {
+    return std::nullopt;
+  }
+  return id;
+}
+
 Value Value::Make(KeyType type) {
   Value v;
   switch (type) {
@@ -44,6 +82,9 @@ Value Value::Make(KeyType type) {
       break;
     case KeyType::kZSet:
       v.data_ = std::make_unique<ZSet>();
+      break;
+    case KeyType::kStream:
+      v.data_ = std::make_unique<Stream>();
       break;
     case KeyType::kNone:
     case KeyType::kString:
@@ -70,6 +111,9 @@ Value Value::Clone() const {
     case KeyType::kZSet:
       copy.data_ = std::make_unique<ZSet>(zset());
       break;
+    case KeyType::kStream:
+      copy.data_ = std::make_unique<Stream>(stream());
+      break;
     case KeyType::kNone:
       break;
   }
@@ -86,8 +130,10 @@ KeyType Value::type() const {
       return KeyType::kHash;
     case 3:
       return KeyType::kSet;
-    default:
+    case 4:
       return KeyType::kZSet;
+    default:
+      return KeyType::kStream;
   }
 }
 
@@ -101,6 +147,8 @@ size_t Value::element_count() const {
       return set().size();
     case KeyType::kZSet:
       return zset().size();
+    case KeyType::kStream:
+      return stream().entries.size();
     default:
       return 0;
   }
@@ -124,6 +172,12 @@ size_t Value::ApproxEncodedBytes() const {
       break;
     case KeyType::kZSet:
       for (const auto& [m, score] : zset().scores) bytes += m.size() + 12;
+      break;
+    case KeyType::kStream:
+      // A payload, its length prefix, the flag, the ID and the record's own
+      // header and key.
+      for (const StreamEntry& e : stream().entries)
+        bytes += e.payload.size() + 40;
       break;
     case KeyType::kNone:
       break;

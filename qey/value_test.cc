@@ -1,5 +1,7 @@
 #include "qey/value.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,55 @@ TEST(ZSetTest, SettingTheSameScoreChangesNothingAndRemoveCleansBoth) {
   EXPECT_FALSE(z.Remove("a"));
   EXPECT_EQ(z.size(), 0);
   EXPECT_EQ(z.order.size(), 0);
+}
+
+TEST(StreamIdTest, OrdersByMillisecondsThenSequence) {
+  EXPECT_LT((StreamId{1, 9}), (StreamId{2, 0}));
+  EXPECT_LT((StreamId{2, 0}), (StreamId{2, 1}));
+  EXPECT_EQ((StreamId{2, 1}), (StreamId{2, 1}));
+}
+
+TEST(StreamIdTest, NextIsTheSmallestGreaterId) {
+  EXPECT_EQ((StreamId{5, 3}).Next(), (StreamId{5, 4}));
+  const uint64_t top = INT64_MAX;
+  EXPECT_EQ((StreamId{5, top}).Next(), (StreamId{6, 0}));
+  // The largest ID has no successor.
+  EXPECT_EQ((StreamId{top, top}).Next(), (StreamId{top, top}));
+}
+
+TEST(StreamIdTest, ParseAndToStringRoundTrip) {
+  EXPECT_EQ((StreamId{1760000000000, 7}).ToString(), "1760000000000-7");
+  EXPECT_EQ(StreamId::Parse("1760000000000-7"), (StreamId{1760000000000, 7}));
+  EXPECT_EQ(StreamId::Parse("12"), (StreamId{12, 0}));  // "ms" means ms-0
+  EXPECT_EQ(StreamId::Parse("0-0"), (StreamId{0, 0}));
+  const StreamId top{INT64_MAX, INT64_MAX};
+  EXPECT_EQ(StreamId::Parse(top.ToString()), top);
+}
+
+TEST(StreamIdTest, ParseRejectsAnythingElse) {
+  for (const char* bad :
+       {"", "-", "1-", "-1", "-1-2", "+1", "1-+2", " 1", "1 ", "1-2-3", "a",
+        "1-b", "0x10", "1.5", "9223372036854775808", "1-9223372036854775808",
+        "99999999999999999999999"}) {
+    EXPECT_EQ(StreamId::Parse(bad), std::nullopt) << bad;
+  }
+}
+
+TEST(ValueTest, StreamsMakeCloneAndCount) {
+  Value v = Value::Make(KeyType::kStream);
+  EXPECT_EQ(v.type(), KeyType::kStream);
+  EXPECT_EQ(v.element_count(), 0);
+  v.stream().entries.push_back({{5, 0}, "a"});
+  v.stream().entries.push_back({{5, 1}, "bc"});
+  v.stream().last_id = {5, 1};
+  EXPECT_EQ(v.element_count(), 2);
+  EXPECT_GE(v.ApproxEncodedBytes(), 3);
+  Value copy = v.Clone();
+  v.stream().entries.clear();  // the copy is independent
+  EXPECT_EQ(copy.type(), KeyType::kStream);
+  ASSERT_EQ(copy.stream().entries.size(), 2);
+  EXPECT_EQ(copy.stream().entries[1].payload, "bc");
+  EXPECT_EQ(copy.stream().last_id, (StreamId{5, 1}));
 }
 
 }  // namespace
