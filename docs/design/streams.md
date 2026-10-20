@@ -1,6 +1,6 @@
 # Streams design
 
-Status: accepted (opaque entries, empty streams stay, time-based IDs)
+Status: implemented in the log and `Db`; `WriteBatch` and the CLI are still to come (opaque entries, empty streams stay, time-based IDs)
 
 ## Goals
 
@@ -150,15 +150,18 @@ The two `i64` fields are the ones the collection layout already allows.
 As with the other collections, **only effective changes are logged**, resolved
 against the state at the time, so replay does no interpretation:
 
-- `XAdd` logs the ID it assigned, so replay never reads the clock. Replay checks that it is greater than the
-  stream's `last_id` and sets `last_id` to it. An ID that is not greater is a
-  corrupt log and fails `Open` with `kCorruption`.
+- `XAdd` logs the ID it assigned, so replay never reads the clock. Replay
+  appends the entry and sets `last_id` to its ID. An ID that is not greater than
+  the stream's `last_id` does not fit the stream, so replay ignores the record,
+  as it does any collection record that does not fit what the log holds.
 - A trim, whether by length or by ID, logs one `XTRIM` with an absolute
   `min_id`, never a count. It removes entries with an ID below `min_id` and
-  raises `last_id` to at least the ID just before `min_id` (0-0 if there is
-  none). The second part is what lets one
-  record express "the stream is now empty but remembers where it was".
-  `XAdd` with `max_len` is a `BATCH` of an `XADD` and an `XTRIM`.
+  leaves `last_id` alone. A trim only removes from the front, so while a stream
+  has entries its `last_id` is the newest one's ID, and a trim that removes
+  everything leaves an empty stream that still remembers it. The plan clamps
+  `min_id` to `last_id.Next()`, so a trim past the end means "everything" and
+  never reaches into the future. `XAdd` with `max_len` is a `BATCH` of an
+  `XADD` and an `XTRIM`.
 - A trim that removes nothing logs nothing. `XTrimMaxLen` on a stream that is
   within the limit is a no-op.
 - `fresh` means the same as for other collections: when an add creates a stream
@@ -171,12 +174,13 @@ existing rule already gives the safe behavior, so the header version stays 1.
 
 ## Compaction
 
-A stream is written as `XADD` records in pieces of about
-`compact_chunk_bytes`, the first with `fresh = 1`, so no record outgrows the
-record limit. Each carries the ID the entry already has, so IDs survive
-compaction. If `last_id` is greater than the newest entry's ID (the tail was
-trimmed or the stream is empty), an `XTRIM` with `min_id = last_id.Next()`
-follows, which restores `last_id`. An `EXPIRE` follows if the key has a TTL,
+A stream is written as one `XADD` record for each entry, the first with
+`fresh = 1`, so no record outgrows the record limit (a payload is at most
+`kMaxValueSize`). Each carries the ID the entry already has, so IDs survive
+compaction. A stream with no entries cannot be recreated by trimming, which
+needs a stream to exist, so it is written as an `XADD` of an empty payload with
+its `last_id`, then an `XTRIM` with `min_id = last_id.Next()` that removes it
+again. An `EXPIRE` follows if the key has a TTL,
 as for other collections.
 
 ## Expiry and `Rename`
@@ -234,7 +238,7 @@ memory per entry and file size, like the existing suites.
   empty stream with a high `last_id`, a stream with a TTL.
 - `fresh`: a stream that expired in memory and is recreated under the same
   key, then replayed.
-- A corrupt log with a non-increasing ID fails `Open` with `kCorruption`.
+- A log record with an ID that is not newer than the stream's is ignored.
 - `asan` and `tsan` for concurrent `XAdd` and `XRange`.
 
 **Where tests run.** Locally, run only the targets for the code being changed,

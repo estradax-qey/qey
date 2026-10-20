@@ -67,9 +67,8 @@ struct Record {
     // key, n1 (fresh), items (the one payload), n2 and n3 (the entry's ID,
     // greater than any the stream has held). It becomes the stream's last ID.
     kXAdd = 21,
-    // key, n1 and n2 (an ID): removes the entries with a smaller ID and raises
-    // the stream's last ID to at least the one just before it. The stream stays
-    // even if no entries are left.
+    // key, n1 and n2 (an ID): removes the entries with a smaller ID. The stream
+    // stays, with its last ID, even if no entries are left.
     kXTrim = 22,
   };
 
