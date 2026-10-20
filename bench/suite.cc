@@ -224,6 +224,72 @@ void InMemorySpeed(const Config& config, Report* report) {
                Consume(v);
              }));
   }
+  // Streams, as for chat sessions: many streams, each appended to over time.
+  {
+    Db st;
+    const size_t groups = 100;
+    const std::vector<std::string> streams =
+        Names(groups, [](size_t i) { return GroupName("stream:", i); });
+    AddSpeed(report, "stream xadd",
+             Measure(n, sample,
+                     [&](size_t i) {
+                       Must(st.XAdd(streams[i % groups], value), "xadd");
+                     }),
+             "100 streams");
+    const size_t slow = std::min<size_t>(n, 20000);
+    AddSpeed(report, "stream xrevrange (newest 20)",
+             Measure(slow, SampleEvery(slow),
+                     [&](size_t i) {
+                       auto v = st.XRevRange(streams[i % groups], 20);
+                       Consume(v);
+                     }),
+             "the last messages of a session");
+    // Resume from an entry somewhere in the stream, as a client would.
+    std::vector<std::vector<StreamId>> ids(groups);
+    for (size_t g = 0; g < groups; ++g) {
+      StatusOr<std::vector<StreamEntry>> all =
+          st.XRange(streams[g], StreamId(), SIZE_MAX);
+      Must(all, "xrange");
+      for (const StreamEntry& e : *all) ids[g].push_back(e.id);
+    }
+    AddSpeed(report, "stream xrange (page of 100)",
+             Measure(slow, SampleEvery(slow),
+                     [&](size_t i) {
+                       const std::vector<StreamId>& list = ids[i % groups];
+                       if (list.empty()) return;
+                       auto v = st.XRange(streams[i % groups],
+                                          list[order[i] % list.size()], 100);
+                       Consume(v);
+                     }),
+             "from a random entry onwards");
+  }
+  {
+    Db st;
+    const size_t groups = 100;
+    const std::vector<std::string> streams =
+        Names(groups, [](size_t i) { return GroupName("stream:", i); });
+    // A batch keeps a copy of what it changes, to undo it if the log write
+    // fails, so touching a stream in a batch costs time in proportion to the
+    // stream's length.
+    const size_t batches = std::max<size_t>(n / 10, 1);
+    Db in_batch;
+    AddSpeed(report, "stream xadd in a write batch",
+             Measure(batches, SampleEvery(batches),
+                     [&](size_t i) {
+                       WriteBatch batch;
+                       batch.XAdd(streams[i % groups], value)
+                           .Set(keys[i % keys.size()], value);
+                       Must(in_batch.Write(batch), "batch");
+                     }),
+             "copies the stream for rollback: slower as it grows (here up to "
+             "200 entries)");
+    AddSpeed(report, "stream xadd (keep newest 1000)",
+             Measure(n, sample,
+                     [&](size_t i) {
+                       Must(st.XAdd(streams[i % groups], value, 1000), "xadd");
+                     }),
+             "100 streams, each trimmed to 1000 entries");
+  }
 }
 
 void PersistentSpeed(const Config& config, const std::string& dir,
@@ -250,6 +316,18 @@ void PersistentSpeed(const Config& config, const std::string& dir,
              Measure(n, SampleEvery(n),
                      [&](size_t i) { Must(db->Set(keys[i], value), "set"); }),
              "appends to the log; flushed only on Sync()");
+  }
+  {
+    std::unique_ptr<Db> db = open(SyncPolicy::kManual);
+    const std::vector<std::string> streams =
+        Names(100, [](size_t i) { return GroupName("stream:", i); });
+    AddSpeed(report, "persistent xadd (sync: manual)",
+             Measure(n, SampleEvery(n),
+                     [&](size_t i) {
+                       Must(db->XAdd(streams[i % streams.size()], value),
+                            "xadd");
+                     }),
+             "100 streams; appends to the log, flushed only on Sync()");
   }
   {
     std::unique_ptr<Db> db = open(SyncPolicy::kInterval);
@@ -352,6 +430,20 @@ void MemorySection(const Config& config, Report* report) {
                      "hset");
               }
             });
+  AddMemory(report, "stream: one stream of N entries", n, key_len + n * v,
+            [&](Db& db) {
+              for (size_t i = 0; i < n; ++i) {
+                Must(db.XAdd("st", value), "xadd");
+              }
+            });
+  // Chat sessions: 100 entries each.
+  const size_t sessions = std::max<size_t>(n / 100, 1);
+  AddMemory(report, "streams: many of 100 entries", sessions * 100,
+            sessions * (key_len + 100 * v), [&](Db& db) {
+              for (size_t i = 0; i < sessions * 100; ++i) {
+                Must(db.XAdd(KeyName(i / 100), value), "xadd");
+              }
+            });
   AddMemory(report, "list: one list of N elements", n, key_len + n * v,
             [&](Db& db) {
               for (size_t i = 0; i < n; ++i) {
@@ -414,6 +506,16 @@ void SizeSection(const Config& config, const std::string& dir, Report* report) {
                          for (size_t i = 0; i < n; ++i) {
                            Must(db.HSet("h", FieldName(i), other), "hset");
                          }
+                       }});
+  scenarios.push_back({"stream: N entries, one call each", n, key_len + n * v,
+                       [&](Db& db) {
+                         for (size_t i = 0; i < n; ++i)
+                           Must(db.XAdd("st", value), "xadd");
+                       },
+                       [&](Db& db) {  // N more, then keep the newest N
+                         for (size_t i = 0; i < n; ++i)
+                           Must(db.XAdd("st", other), "xadd");
+                         Must(db.XTrimMaxLen("st", n), "xtrim");
                        }});
   scenarios.push_back({"list: N elements, one call each", n, key_len + n * v,
                        [&](Db& db) {

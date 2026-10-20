@@ -86,6 +86,9 @@ TEST(SuiteTest, SpeedResultsAreSane) {
   for (const char* expected :
        {"string set (new key)", "string get (hit)", "write batch of 10 sets",
         "hash hset (new field)", "list rpush", "set sadd", "zset zadd",
+        "stream xadd", "stream xrevrange (newest 20)",
+        "stream xrange (page of 100)", "stream xadd (keep newest 1000)",
+        "stream xadd in a write batch", "persistent xadd (sync: manual)",
         "persistent set (sync: always)", "open and replay the log",
         "compact the log"}) {
     EXPECT_TRUE(names.count(expected)) << expected;
@@ -113,7 +116,7 @@ TEST(SuiteTest, FileSizesFollowFromHowTheLogWorks) {
   Config c = Small();
   c.section = "size";
   Report r = RunSuite(c);
-  ASSERT_EQ(r.sizes.size(), 5u);
+  ASSERT_EQ(r.sizes.size(), 6u);
   for (const SizeResult& s : r.sizes) {
     EXPECT_GT(s.payload_bytes, 0u) << s.name;
     // Every record carries framing, so the log is bigger than what it holds.
@@ -132,7 +135,7 @@ TEST(SuiteTest, MemoryIsMeasuredPerScenarioAndCannotBeLessThanThePayload) {
   c.keys = 6000;  // enough that page rounding does not matter
   c.section = "memory";
   Report r = RunSuite(c);
-  ASSERT_EQ(r.memory.size(), 6u);
+  ASSERT_EQ(r.memory.size(), 8u);
   for (const MemoryResult& m : r.memory) {
     EXPECT_GT(m.elements, 0u) << m.name;
     EXPECT_GT(m.payload_bytes, 0u) << m.name;

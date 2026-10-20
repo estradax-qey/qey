@@ -57,57 +57,72 @@ qey benchmark
 
 SPEED
 scenario                                  ops/sec       mean        p50        p99      p99.9        max
-string set (new key)                    3,216,205     311 ns     209 ns    2.08 us    5.21 us   15.83 us
-string set (overwrite)                  3,364,508     297 ns     250 ns    1.08 us    4.04 us   30.54 us
-string get (hit)                        6,223,961     161 ns     166 ns     417 ns     542 ns    8.33 us
-string get (miss)                      12,486,310      80 ns      42 ns     458 ns     583 ns    7.54 us
-incr (1000 counters)                    8,546,308     117 ns     125 ns     167 ns     375 ns    6.75 us
-keys index build (first scan)                   -   44.26 ms   44.26 ms   44.26 ms   44.26 ms   44.26 ms
+string set (new key)                    3,061,796     327 ns     250 ns    2.25 us    5.12 us   99.79 us
+string set (overwrite)                  3,201,679     312 ns     292 ns    1.04 us    3.29 us   10.12 us
+string get (hit)                        6,031,188     166 ns     167 ns     458 ns     916 ns   34.71 us
+string get (miss)                      11,116,566      90 ns      42 ns     459 ns     625 ns    1.92 us
+incr (1000 counters)                    8,431,792     119 ns     125 ns     167 ns     375 ns    4.79 us
+keys index build (first scan)                   -   47.79 ms   47.79 ms   47.79 ms   47.79 ms   47.79 ms
     (one-time cost, then kept up to date)
-scan a page of 100 keys                   126,625    7.90 us    7.50 us   12.71 us   15.29 us   19.83 us
-write batch of 10 sets                    203,182    4.92 us    4.62 us   10.17 us   13.83 us   46.62 us
+scan a page of 100 keys                   122,641    8.15 us    7.96 us   11.21 us   21.83 us   25.71 us
+write batch of 10 sets                    193,557    5.17 us    4.88 us   10.46 us   18.08 us  110.58 us
     (each operation is a batch of 10)
-string del                              1,488,941     672 ns     625 ns    1.38 us    4.33 us   20.33 us
-hash hset (new field)                   2,406,586     416 ns     375 ns    2.50 us    5.33 us    8.58 us
+string del                              1,423,844     702 ns     667 ns    1.42 us    3.92 us   14.75 us
+hash hset (new field)                   2,409,966     415 ns     375 ns    2.25 us    5.12 us   11.67 us
     (1000 hashes)
-hash hget                              11,783,941      85 ns      83 ns     167 ns    1.08 us    1.42 us
-list rpush                              4,229,738     236 ns     209 ns     375 ns    1.58 us    7.50 us
+hash hget                              11,843,108      84 ns      83 ns     167 ns     667 ns    3.29 us
+list rpush                              4,115,706     243 ns     209 ns    1.00 us    1.71 us   23.42 us
     (100 lists)
-list lpop                               6,238,384     160 ns     167 ns    1.17 us    1.33 us    1.54 us
-set sadd                                2,744,800     364 ns     375 ns     583 ns     708 ns    2.67 us
+list lpop                               6,269,559     160 ns     167 ns     291 ns    1.50 us   14.46 us
+set sadd                                2,784,665     359 ns     375 ns    3.92 us    6.58 us   17.50 us
     (100 sets)
-set sismember                          13,486,935      74 ns      83 ns     541 ns    4.46 us    6.75 us
-zset zadd                               1,397,731     715 ns     708 ns    4.58 us    7.29 us   32.71 us
+set sismember                          13,663,535      73 ns      83 ns     208 ns    2.12 us    6.62 us
+zset zadd                               1,356,717     737 ns     708 ns    1.29 us    2.17 us    5.67 us
     (100 sorted sets)
-zset zscore                            13,941,329      72 ns      83 ns     167 ns     625 ns    1.21 us
-zset zrank                                 49,409   20.24 us   17.75 us   64.62 us   87.42 us  130.67 us
+zset zscore                            13,470,621      74 ns      83 ns     167 ns     667 ns    1.08 us
+zset zrank                                 42,606   23.47 us   19.88 us   80.83 us  121.62 us  528.25 us
     (walks the order index: cost grows with the rank)
-zset zrange (first 10)                  4,141,965     241 ns     209 ns     292 ns     458 ns    8.42 us
-persistent set (sync: manual)             452,632    2.21 us    2.00 us    5.62 us    8.04 us   28.17 us
+zset zrange (first 10)                  4,225,910     237 ns     208 ns     250 ns     458 ns   15.17 us
+stream xadd                             4,936,438     203 ns     208 ns     334 ns    3.50 us    9.67 us
+    (100 streams)
+stream xrevrange (newest 20)            1,481,166     675 ns     625 ns     792 ns     958 ns   15.12 us
+    (the last messages of a session)
+stream xrange (page of 100)               184,212    5.43 us    5.67 us    7.38 us   16.50 us   24.21 us
+    (from a random entry onwards)
+stream xadd in a write batch              307,996    3.25 us    2.96 us    7.00 us   11.12 us  213.33 us
+    (copies the stream for rollback: slower as it grows (here up to 200 entries))
+stream xadd (keep newest 1000)          3,133,554     319 ns     333 ns    1.38 us    3.33 us    6.50 us
+    (100 streams, each trimmed to 1000 entries)
+persistent set (sync: manual)             435,949    2.29 us    2.04 us    5.42 us    8.54 us  731.83 us
     (appends to the log; flushed only on Sync())
-persistent set (sync: every 1s)           445,211    2.25 us    2.00 us    5.67 us    8.75 us   27.92 us
+persistent xadd (sync: manual)            439,322    2.28 us    2.04 us    5.08 us   10.17 us   16.85 ms
+    (100 streams; appends to the log, flushed only on Sync())
+persistent set (sync: every 1s)           446,438    2.24 us    2.04 us    5.38 us    9.17 us   16.96 us
     (flushes at most once a second)
-persistent set (sync: always)                 265    3.77 ms    3.98 ms    6.02 ms   10.31 ms   10.31 ms
+persistent set (sync: always)                 264    3.78 ms    3.98 ms    5.66 ms   15.09 ms   15.09 ms
     (flushes to disk on every write; 1000 writes)
-open and replay the log                   752,464    1.33 us
+open and replay the log                   741,455    1.35 us
     (ops are log records: 400000 for 200000 keys)
-compact the log                           839,169    1.19 us
+compact the log                           738,125    1.35 us
     (ops are live keys written; the log held 400000 records)
 
 MEMORY (footprint of a fresh process, database in memory only)
 scenario                                elements     payload      memory  per element  x payload
 strings: one key each                    200,000    14.5 MiB    37.5 MiB      196.4 B      2.58x
-hash: one hash of N fields               200,000    14.9 MiB    31.1 MiB      162.9 B      2.09x
-hashes: many hashes of 10 fields         200,000    15.1 MiB    34.0 MiB      178.3 B      2.25x
-list: one list of N elements             200,000    12.2 MiB    20.2 MiB      105.8 B      1.65x
-set: one set of N members                200,000     2.9 MiB    12.4 MiB       65.2 B      4.35x
-sorted set: one set of N members         200,000     4.4 MiB    24.8 MiB      130.2 B      5.66x
+hash: one hash of N fields               200,000    14.9 MiB    31.1 MiB      163.1 B      2.09x
+hashes: many hashes of 10 fields         200,000    15.1 MiB    34.0 MiB      178.4 B      2.25x
+stream: one stream of N entries          200,000    12.2 MiB    23.2 MiB      121.7 B      1.90x
+streams: many of 100 entries             200,000    12.2 MiB    23.8 MiB      124.5 B      1.94x
+list: one list of N elements             200,000    12.2 MiB    20.2 MiB      105.7 B      1.65x
+set: one set of N members                200,000     2.9 MiB    12.5 MiB       65.5 B      4.36x
+sorted set: one set of N members         200,000     4.4 MiB    24.8 MiB      130.1 B      5.66x
   payload = the keys and values themselves; "x payload" is the overhead of storing them.
 
 FILE SIZE (the .qey log)
 scenario                                  payload          after load       after rewrite       after compact
 strings: one key each                    14.5 MiB    19.3 MiB (1.33x)    38.5 MiB (2.66x)    19.3 MiB (1.33x)
 hash: N fields, one call each            14.9 MiB    20.0 MiB (1.35x)    40.1 MiB (2.69x)    16.4 MiB (1.10x)
+stream: N entries, one call each         12.2 MiB    19.8 MiB (1.62x)    39.7 MiB (3.25x)    19.8 MiB (1.62x)
 list: N elements, one call each          12.2 MiB    16.6 MiB (1.36x)    34.5 MiB (2.83x)    13.0 MiB (1.06x)
 set: N members, one call each             2.9 MiB     7.2 MiB (2.53x)    21.6 MiB (7.53x)     3.6 MiB (1.27x)
 sorted set: N members, one call each      4.4 MiB     8.8 MiB (2.00x)    17.5 MiB (4.00x)     5.1 MiB (1.17x)
@@ -144,6 +159,21 @@ will differ; the shape should not.)
   is compacted. After compaction a collection is written in large pieces and is
   within 6 to 27% of its payload; a string, which compaction writes as the same
   record it started as, stays at 1.33 times.
+- **Streams are the cheapest write there is, and trimming is nearly free.**
+  Appending an entry takes about 200 ns (5 million a second), because it is a
+  push onto a deque. Keeping only the newest 1000 adds about 120 ns
+  (320 ns in all). Reading the newest 20 entries of a session takes 0.7 us, and
+  a page of 100 from the middle 5.4 us (a binary search by ID, then a copy). An
+  entry costs about 122 bytes of memory for a 64-byte payload (1.9 times it),
+  and 104 bytes in the log (1.62 times), which does not shrink on compaction
+  because each entry is one record. Adding an entry with `max_len` plans the
+  add and the trim together and logs them as one record, so it does not depend
+  on the length of the stream.
+- **A `WriteBatch` that touches a stream copies it.** To undo the batch if the
+  log write fails, a batch keeps a copy of every key it changes, so a batch
+  with a stream in it costs time in proportion to the stream's length. Here the
+  streams reach 200 entries and an add in a batch takes 3.3 us, against 0.2 us
+  alone. For a very long stream, use `XAdd` with `max_len` rather than a batch.
 - **`ZRANK` is the slow one.** It walks the ordered index, so it costs time
   proportional to the rank (21 us here at an average rank of 1,000). Everything
   else in the sorted set is fast.
