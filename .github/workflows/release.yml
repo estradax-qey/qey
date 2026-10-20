@@ -46,14 +46,15 @@ jobs:
           - target: linux-arm64
             os: ubuntu-22.04-arm
             flags: --linkopt=-static-libstdc++ --linkopt=-static-libgcc
+          # std::to_chars for doubles needs macOS 13.3.
           - target: macos-arm64
             os: macos-latest
-            flags: --macos_minimum_os=12.0
+            flags: --macos_minimum_os=13.3
           # Cross-compiled on the arm64 runner. Run under Rosetta if it is
           # there, to smoke-test it.
           - target: macos-x86_64
             os: macos-latest
-            flags: --macos_cpus=x86_64 --macos_minimum_os=12.0
+            flags: --macos_cpus=x86_64 --macos_minimum_os=13.3
             exec: arch -x86_64
     steps:
       - uses: actions/checkout@v7
