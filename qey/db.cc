@@ -646,20 +646,51 @@ StatusOr<StreamId> Db::XAdd(std::string_view key, std::string_view payload,
     return r->id;
   }
   // The add and the trim are logged together, so a crash cannot leave the
-  // stream over its limit.
-  WriteBatch::Op trim =
-      WriteBatch::MakeOp(WriteBatch::Op::Type::kXTrimMaxLen, key);
-  trim.n1 = static_cast<int64_t>(std::min<size_t>(*max_len, INT64_MAX));
-  const std::vector<WriteBatch::Op> ops = {std::move(add), std::move(trim)};
-  for (const WriteBatch::Op& op : ops) {
-    Status valid = ValidateOp(op);
-    if (!valid.ok()) return valid;
-  }
+  // stream over its limit. Both are planned here, the trim against the stream
+  // as it will be after the add, so that nothing is applied before the log
+  // write and a batch's copy of the whole stream is not needed.
+  Status valid = ValidateOp(add);
+  if (!valid.ok()) return valid;
   std::lock_guard<std::mutex> lock(mu_);
-  std::vector<OpResult> results;
-  Status s = WriteLocked(ops, &results);
+  MaybeCompactLocked();
+  const ClockPoint ref = ReadClocks();
+  std::optional<Record> add_record;
+  OpResult added;
+  Status s = PlanLocked(add, ref, &add_record, &added);
   if (!s.ok()) return s;
-  return results[0].id;
+
+  Record trim_record;
+  trim_record.type = Record::Type::kXTrim;
+  trim_record.key = std::string(key);
+  bool trims = false;
+  Map::iterator it = FindLive(key);
+  const auto* entries =
+      it == map_.end() ? nullptr : &it->second.value.stream().entries;
+  const size_t existing = entries == nullptr ? 0 : entries->size();
+  if (existing + 1 > *max_len) {
+    // The smallest ID to keep: the one that ends up `max_len` from the end.
+    StreamId keep_from = added.id.Next();
+    if (*max_len > 0) {
+      const size_t first_kept = existing + 1 - *max_len;
+      keep_from = first_kept < existing ? (*entries)[first_kept].id : added.id;
+    }
+    trim_record.n1 = static_cast<int64_t>(keep_from.ms);
+    trim_record.n2 = static_cast<int64_t>(keep_from.seq);
+    trims = true;
+  }
+
+  Record logged;
+  if (trims) {
+    logged.type = Record::Type::kBatch;
+    logged.records = {*add_record, trim_record};
+  } else {
+    logged = *add_record;
+  }
+  s = LogLocked(logged);
+  if (!s.ok()) return s;
+  ApplyRecordLocked(std::move(*add_record), ref);
+  if (trims) ApplyRecordLocked(std::move(trim_record), ref);
+  return added.id;
 }
 
 StatusOr<size_t> Db::XLen(std::string_view key) {
