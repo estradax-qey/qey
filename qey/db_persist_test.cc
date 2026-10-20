@@ -319,6 +319,16 @@ std::string Dump(Db& db, const std::string& key) {
       }
       return out;
     }
+    case KeyType::kStream: {
+      std::string out =
+          "stream:last=" + db.XLastId(key)->value().ToString() + ";";
+      StatusOr<std::vector<StreamEntry>> all =
+          db.XRange(key, StreamId(), std::numeric_limits<size_t>::max());
+      for (const StreamEntry& e : *all) {
+        out += e.id.ToString() + "=" + e.payload + ",";
+      }
+      return out;
+    }
     default:
       return "?";
   }
@@ -1398,12 +1408,12 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
     auto key = [&] { return "k" + std::to_string(pick(8)); };
 
     auto persistent = Open(options);
-    Db reference([this] { return steady_; });
+    Db reference([this] { return steady_; }, [this] { return wall_; });
     ASSERT_NE(persistent, nullptr);
 
     for (int i = 0; i < 2000; ++i) {
       const std::string k = key();
-      switch (pick(17)) {
+      switch (pick(18)) {
         case 0:
           ASSERT_TRUE(persistent->Set(k, std::to_string(pick(100))).ok());
           ASSERT_TRUE(reference.Set(k, persistent->Get(k).value()).ok());
@@ -1461,6 +1471,45 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
             ASSERT_TRUE(reference.Clear().ok());
           }
           break;
+        case 17: {
+          const std::string payload = "p" + std::to_string(pick(100));
+          switch (pick(7)) {
+            case 0:
+              ExpectSame(persistent->XAdd(k, payload),
+                         reference.XAdd(k, payload));
+              break;
+            case 1: {
+              const size_t n = pick(4);
+              ExpectSame(persistent->XAdd(k, payload, n),
+                         reference.XAdd(k, payload, n));
+              break;
+            }
+            case 2: {
+              const size_t n = pick(4);
+              ExpectSame(persistent->XTrimMaxLen(k, n),
+                         reference.XTrimMaxLen(k, n));
+              break;
+            }
+            case 3: {
+              const StreamId id{1700000000000u + pick(40), 0};
+              ExpectSame(persistent->XTrimMinId(k, id),
+                         reference.XTrimMinId(k, id));
+              break;
+            }
+            case 4:
+              ExpectSame(persistent->XRange(k, StreamId(), 3),
+                         reference.XRange(k, StreamId(), 3));
+              break;
+            case 5:
+              ExpectSame(persistent->XRevRange(k, 3),
+                         reference.XRevRange(k, 3));
+              break;
+            case 6:
+              ExpectSame(persistent->XLastId(k), reference.XLastId(k));
+              break;
+          }
+          break;
+        }
         case 16: {
           const std::string m = "m" + std::to_string(pick(6));
           const double score = pick(7) - 3;
@@ -1821,6 +1870,191 @@ TEST_F(PersistTest, CompactOnInMemoryDbIsNoOp) {
   ASSERT_TRUE(db.Set("a", "1").ok());
   EXPECT_TRUE(db.Compact().ok());
   EXPECT_EQ(db.Get("a"), "1");
+}
+
+// The payload of the newest entry.
+std::string Payload(Db& db, const std::string& key) {
+  return db.XRevRange(key, 1)->at(0).payload;
+}
+
+// A stream's text as Dump() shows it, for the entries and last ID given.
+std::string StreamText(const StreamId& last,
+                       const std::vector<std::pair<StreamId, std::string>>& e) {
+  std::string out = "stream:last=" + last.ToString() + ";";
+  for (const auto& [id, payload] : e)
+    out += id.ToString() + "=" + payload + ",";
+  return out;
+}
+
+TEST_F(PersistTest, StreamsSurviveReopenWithTheirIdsAndTtl) {
+  std::string before;
+  StreamId last;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->XAdd("s", "a").ok());
+    Advance(milliseconds(5));
+    ASSERT_TRUE(db->XAdd("s", "b").ok());
+    ASSERT_TRUE(db->XAdd("s", std::string("\0bin\n", 5)).ok());
+    ASSERT_EQ(*db->XTrimMinId("s", StreamId{1700000000005, 0}), 1);
+    ASSERT_TRUE(*db->Expire("s", seconds(100)));
+    ASSERT_TRUE(db->XAdd("gone", "x", 0).ok());
+    ASSERT_TRUE(*db->Del("gone"));
+    last = **db->XLastId("s");
+    before = Dump(*db, "s");
+  }
+  Restart(seconds(40));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "s"), before);
+  EXPECT_EQ(db->GetTtl("s").remaining, seconds(60));
+  EXPECT_EQ(db->Type("gone"), KeyType::kNone);
+  StatusOr<StreamId> next = db->XAdd("s", "after");
+  ASSERT_TRUE(next.ok());
+  EXPECT_GT(*next, last);
+}
+
+TEST_F(PersistTest, AnEmptiedStreamKeepsItsLastIdThroughReopenAndCompaction) {
+  StreamId last;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->XAdd("s", "a").ok());
+    StatusOr<StreamId> id = db->XAdd("s", "b", 0);  // trims everything
+    ASSERT_TRUE(id.ok());
+    last = *id;
+    ASSERT_EQ(*db->XLen("s"), 0);
+  }
+  for (int round = 0; round < 3; ++round) {
+    {
+      auto db = Open();
+      EXPECT_EQ(Dump(*db, "s"), StreamText(last, {})) << round;
+      EXPECT_EQ(db->Type("s"), KeyType::kStream);
+      ASSERT_TRUE(db->Compact().ok());  // and compaction keeps it too
+    }
+    Restart(seconds(0));
+  }
+  // Even with the clock far behind, the next ID is still greater.
+  Restart(milliseconds(-100000));
+  auto db = Open();
+  StatusOr<StreamId> next = db->XAdd("s", "c");
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(*next, (StreamId{last.ms, last.seq + 1}));
+}
+
+TEST_F(PersistTest, TheClockGoingBackwardsAcrossARestartKeepsIdsGrowing) {
+  StreamId last;
+  {
+    auto db = Open();
+    last = *db->XAdd("s", "a");
+  }
+  Restart(milliseconds(-5000));
+  auto db = Open();
+  EXPECT_EQ(*db->XAdd("s", "b"), (StreamId{last.ms, last.seq + 1}));
+}
+
+TEST_F(PersistTest, CompactionKeepsAStreamInPiecesThatFitARecord) {
+  std::vector<std::pair<StreamId, std::string>> expected;
+  std::string before;
+  StreamId last;
+  {
+    auto db = Open(SmallChunks(Options()));
+    for (int i = 0; i < 300; ++i) {
+      if (i % 7 == 0) Advance(milliseconds(1));
+      std::string payload = std::to_string(i) + std::string(90, 'x');
+      StatusOr<StreamId> id = db->XAdd("big", payload);
+      ASSERT_TRUE(id.ok());
+      expected.emplace_back(*id, payload);
+      last = *id;
+    }
+    ASSERT_EQ(*db->XTrimMaxLen("big", 250), 50);
+    expected.erase(expected.begin(), expected.begin() + 50);
+    ASSERT_TRUE(*db->Expire("big", seconds(500)));
+    ASSERT_TRUE(db->XAdd("small", "v").ok());
+    ASSERT_TRUE(db->Compact().ok());
+    EXPECT_EQ(storage_->replace_count(), 1);
+  }
+  Restart(seconds(100));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "big"), StreamText(last, expected));
+  EXPECT_EQ(db->GetTtl("big").remaining, seconds(400));
+  // The compacted log holds one record for each entry of the big stream.
+  EXPECT_GE(db->recovery_info().records_replayed, 250);
+}
+
+TEST_F(PersistTest, AnAddWithAMaxLenIsAllOrNothingWhateverByteACrashStopsAt) {
+  StreamId first;
+  uint64_t before;
+  std::string after_bytes;
+  {
+    auto db = Open();
+    first = *db->XAdd("s", "a", 1);
+    before = file_.Size();
+    ASSERT_TRUE(db->XAdd("s", "b", 1).ok());  // the add and the trim, as one
+    after_bytes = file_.data();
+  }
+  Restart(seconds(0));
+  ASSERT_GT(after_bytes.size(), before);
+  for (uint64_t cut = before; cut <= after_bytes.size(); ++cut) {
+    file_.data() = after_bytes.substr(0, cut);
+    auto db = Open();
+    ASSERT_NE(db, nullptr);
+    // Never both entries, and never none.
+    if (cut < after_bytes.size()) {
+      EXPECT_EQ(Dump(*db, "s"), StreamText(first, {{first, "a"}})) << cut;
+    } else {
+      EXPECT_EQ(*db->XLen("s"), 1);
+      EXPECT_EQ(Payload(*db, "s"), "b");
+    }
+  }
+}
+
+TEST_F(PersistTest, ANewStreamDoesNotInheritAStaleExpiredEntryAfterRestart) {
+  // "s" expires without anyone touching it, so the log still holds its
+  // entries and deadline. Creating a stream under the name afterwards has to
+  // start from nothing, or recovery would merge into the stale one.
+  std::string live;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->XAdd("s", "old1").ok());
+    ASSERT_TRUE(db->XAdd("s", "old2").ok());
+    ASSERT_TRUE(*db->Expire("s", seconds(10)));
+    ASSERT_TRUE(db->Set("t", "string", seconds(10)).ok());
+    Advance(seconds(10));  // both expire, unnoticed
+
+    ASSERT_TRUE(db->XAdd("s", "new").ok());
+    ASSERT_TRUE(db->XAdd("t", "new").ok());  // over a stale string
+    live = Dump(*db, "s");
+    ASSERT_EQ(*db->XLen("s"), 1);
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "s"), live);
+  EXPECT_EQ(*db->XLen("t"), 1);
+  for (const char* k : {"s", "t"}) {
+    EXPECT_EQ(db->GetTtl(k).state, Db::TtlState::kNoExpiry) << k;
+  }
+}
+
+TEST_F(PersistTest, ReplayIgnoresAnAddThatIsNotNewerThanTheStream) {
+  auto add = [](const char* key, const char* payload, int64_t fresh, int64_t ms,
+                int64_t seq) {
+    Record r;
+    r.type = Record::Type::kXAdd;
+    r.key = key;
+    r.items = {payload};
+    r.n1 = fresh;
+    r.n2 = ms;
+    r.n3 = seq;
+    return r;
+  };
+  ASSERT_TRUE(WriteHeader(file_).ok());
+  for (const Record& r : {add("s", "a", 1, 5, 1), add("s", "same", 0, 5, 1),
+                          add("s", "older", 0, 5, 0), add("s", "b", 0, 5, 2),
+                          add("z", "zero", 1, 0, 0)}) {
+    ASSERT_TRUE(AppendRecord(file_, r).ok());
+  }
+  auto db = Open();
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(Dump(*db, "s"), StreamText({5, 2}, {{{5, 1}, "a"}, {{5, 2}, "b"}}));
+  EXPECT_EQ(db->Type("z"), KeyType::kNone);  // nothing came of 0-0
 }
 
 TEST(DbFileTest, SecondOpenOfSamePathIsRefused) {
