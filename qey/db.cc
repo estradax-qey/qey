@@ -1700,6 +1700,10 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
         ApplyRecordLocked(std::move(member), ref);
       }
       break;
+    case Record::Type::kXAdd:
+    case Record::Type::kXTrim:
+      // The Db does not have streams yet. Nothing writes these records.
+      break;
   }
 }
 

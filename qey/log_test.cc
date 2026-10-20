@@ -70,6 +70,25 @@ Record ZAdd(std::string key, std::vector<std::string> members,
   r.n1 = fresh;
   return r;
 }
+Record XAdd(std::string key, std::string payload, int64_t ms, int64_t seq,
+            int64_t fresh = 0) {
+  Record r;
+  r.type = Type::kXAdd;
+  r.key = std::move(key);
+  r.items = {std::move(payload)};
+  r.n1 = fresh;
+  r.n2 = ms;
+  r.n3 = seq;
+  return r;
+}
+Record XTrim(std::string key, int64_t ms, int64_t seq) {
+  Record r;
+  r.type = Type::kXTrim;
+  r.key = std::move(key);
+  r.n1 = ms;
+  r.n2 = seq;
+  return r;
+}
 Record Replace(std::string key, std::string value) {
   return Record{Type::kReplace, std::move(key), std::move(value), {}};
 }
@@ -114,6 +133,13 @@ std::vector<Record> SampleRecords() {
       ZAdd("z", {"d"}, {-std::numeric_limits<double>::infinity()}),
       ZAdd("z", {"e"}, {std::numeric_limits<double>::denorm_min()}),
       Coll(Type::kZRem, "z", {"a", "c"}),
+      XAdd("x", R"({"role":"user"})", 1760000000000, 0, 1),
+      XAdd("x", std::string("\0bin", 4), 1760000000000, 1),
+      XAdd("x", "", 1760000000123, 0),
+      XAdd("x", "max", INT64_MAX, INT64_MAX),
+      XTrim("x", 1760000000001, 0),
+      XTrim("x", 0, 0),
+      Batch({XAdd("y", "1", 5, 0, 1), XTrim("y", 5, 1)}),
       Replace("a", "42"),
       Replace("", ""),
       Batch({Replace("k", "1"), Set("j", "2")}),
@@ -615,6 +641,86 @@ TEST(ReplayTest, ValidChecksumWithMalformedHashRecordIsCorruption) {
                    u32(2) + one + one) +
              Frame(std::string("\x0a", 1) + key + u32(1) + one));
   EXPECT_TRUE(ReplayAll(ok, Recovery::kStrict).result.ok());
+}
+
+TEST(AppendRecordTest, RejectsInvalidStreamRecords) {
+  MemFile f;
+  Record two_payloads = XAdd("x", "a", 1, 0);
+  two_payloads.items.push_back("b");
+  Record no_payload = XAdd("x", "a", 1, 0);
+  no_payload.items.clear();
+  Record trim_with_payload = XTrim("x", 1, 0);
+  trim_with_payload.items = {"a"};
+  Record add_with_stray = XAdd("x", "a", 1, 0);
+  add_with_stray.expires_at_ms = 5;
+  Record trim_with_fresh_slot = XTrim("x", 1, 0);
+  trim_with_fresh_slot.n3 = 1;  // a trim has no third integer
+  Record other_with_n3 = Coll(Type::kLTrim, "l", {}, 0, 1);
+  other_with_n3.n3 = 1;  // n3 belongs to streams only
+  for (const Record& bad : {
+           XAdd("x", "a", 1, 0, 2),  // bad fresh flag
+           XAdd("x", "a", -1, 0),    // negative milliseconds
+           XAdd("x", "a", 1, -1),    // negative sequence
+           two_payloads,             // exactly one payload
+           no_payload,               //
+           XTrim("x", -1, 0),        // negative milliseconds
+           XTrim("x", 0, -1),        // negative sequence
+           trim_with_payload,        // takes no strings
+           add_with_stray,           // no expiry on a stream record
+           trim_with_fresh_slot,     //
+           other_with_n3,            //
+       }) {
+    EXPECT_EQ(AppendRecord(f, bad).code(), StatusCode::kInvalidArgument);
+  }
+  EXPECT_EQ(f.Size(), 0);
+}
+
+TEST(ReplayTest, ValidChecksumWithMalformedStreamRecordIsCorruption) {
+  auto u32 = [](uint32_t v) {
+    std::string s;
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  auto i64 = [](int64_t v) {
+    std::string s;
+    for (int i = 0; i < 8; ++i) s.push_back(static_cast<char>(v >> (8 * i)));
+    return s;
+  };
+  const std::string key = u32(1) + "x";
+  const std::string one = u32(1) + "a";
+  const std::string fresh0("\x00", 1);
+  const std::vector<std::string> bad_bodies = {
+      std::string("\x15", 1) + key + fresh0 + u32(1) + one + i64(1),  // no seq
+      std::string("\x15", 1) + key + std::string("\x02", 1) + u32(1) + one +
+          i64(1) + i64(0),  // flag 2
+      std::string("\x15", 1) + key + fresh0 + u32(1) + one + i64(-1) + i64(0),
+      std::string("\x15", 1) + key + fresh0 + u32(1) + one + i64(0) + i64(-1),
+      std::string("\x15", 1) + key + fresh0 + u32(2) + one + one + i64(1) +
+          i64(0),  // 2 items
+      std::string("\x15", 1) + key + fresh0 + u32(0) + i64(1) + i64(0),
+      std::string("\x15", 1) + key + fresh0 + u32(1) + one + i64(1) + i64(0) +
+          "!",                                // tail
+      std::string("\x16", 1) + key + i64(1),  // no seq
+      std::string("\x16", 1) + key + i64(-1) + i64(0),
+      std::string("\x16", 1) + key + i64(0) + i64(-1),
+      std::string("\x16", 1) + key + i64(1) + i64(0) + "!",
+      std::string("\x17", 1) + key,  // not a record type
+  };
+  for (const std::string& body : bad_bodies) {
+    MemFile f(HeaderBytes() + Frame(body));
+    Replayed r = ReplayAll(f);
+    ASSERT_FALSE(r.result.ok());
+    EXPECT_EQ(r.result.status().code(), StatusCode::kCorruption);
+  }
+  MemFile ok(HeaderBytes() +
+             Frame(std::string("\x15", 1) + key + std::string("\x01", 1) +
+                   u32(1) + one + i64(7) + i64(3)) +
+             Frame(std::string("\x16", 1) + key + i64(7) + i64(4)));
+  Replayed r = ReplayAll(ok, Recovery::kStrict);
+  ASSERT_TRUE(r.result.ok());
+  ASSERT_EQ(r.records.size(), 2);
+  EXPECT_EQ(r.records[0], XAdd("x", "a", 7, 3, 1));  // ms, seq, then flag
+  EXPECT_EQ(r.records[1], XTrim("x", 7, 4));
 }
 
 TEST(AppendRecordTest, RejectsInvalidRecords) {

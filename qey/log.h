@@ -62,6 +62,15 @@ struct Record {
     // Sorted sets.
     kZAdd = 19,  // key, n1 (fresh), items (members), scores (one for each)
     kZRem = 20,  // key, items (members that were there)
+    // Streams. An ID is a pair of non-negative integers (milliseconds, then
+    // sequence).
+    // key, n1 (fresh), items (the one payload), n2 and n3 (the entry's ID,
+    // greater than any the stream has held). It becomes the stream's last ID.
+    kXAdd = 21,
+    // key, n1 and n2 (an ID): removes the entries with a smaller ID and raises
+    // the stream's last ID to at least the one just before it. The stream stays
+    // even if no entries are left.
+    kXTrim = 22,
   };
 
   Record() = default;
@@ -87,6 +96,7 @@ struct Record {
   // Small integer arguments. Their meaning depends on the type (see above).
   int64_t n1 = 0;
   int64_t n2 = 0;
+  int64_t n3 = 0;
 
   bool operator==(const Record&) const = default;
 };

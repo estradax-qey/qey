@@ -126,16 +126,20 @@ class PayloadReader {
 };
 
 // How a collection record is laid out. After the key come, in this order: a
-// "fresh" flag byte, a list of strings, and up to two integers.
+// "fresh" flag byte, a list of strings, and up to two integers. The flag is
+// held in n1, so the integers use the fields after it: n2 and n3 if there is a
+// flag, otherwise n1 and n2.
 struct Shape {
   bool fresh = false;
   bool strings = false;
   size_t strings_multiple = 1;  // the count must be a multiple of this...
   size_t strings_exact = 0;     // ...and, if non-zero, exactly this
   bool scores = false;          // one score for each string follows them
-  int ints = 0;                 // 0, 1 (n1) or 2 (n1 and n2)
-  int64_t n1_min = 0;
-  int64_t n2_min = 0;
+  int ints = 0;                 // how many integers follow: 0, 1 or 2
+  int64_t first_min = 0;        // the least value of the first integer
+  int64_t second_min = 0;       // and of the second
+  // Where the first integer is kept: 0 for n1, or 1 for n2 after a flag.
+  int first_slot() const { return fresh ? 1 : 0; }
 };
 
 // Returns the layout of a collection record type, or null for other types.
@@ -146,9 +150,12 @@ const Shape* ShapeOf(Record::Type type) {
   static const Shape kFreshStrings{.fresh = true, .strings = true};
   static const Shape kStrings{.strings = true};
   static const Shape kScored{.fresh = true, .strings = true, .scores = true};
-  static const Shape kCount{.ints = 1, .n1_min = 1};
+  static const Shape kCount{.ints = 1, .first_min = 1};
   static const Shape kIndexed{.strings = true, .strings_exact = 1, .ints = 1};
-  static const Shape kRange{.ints = 2, .n2_min = -1};
+  static const Shape kRange{.ints = 2, .second_min = -1};
+  static const Shape kStreamAdd{
+      .fresh = true, .strings = true, .strings_exact = 1, .ints = 2};
+  static const Shape kStreamTrim{.ints = 2};
   switch (type) {
     case T::kHSet:
       return &kPairs;
@@ -169,6 +176,10 @@ const Shape* ShapeOf(Record::Type type) {
       return &kIndexed;
     case T::kLTrim:
       return &kRange;
+    case T::kXAdd:
+      return &kStreamAdd;
+    case T::kXTrim:
+      return &kStreamTrim;
     default:
       return nullptr;
   }
@@ -192,11 +203,16 @@ bool FitsShape(const Shape& shape, const Record& record) {
   } else if (!record.scores.empty()) {
     return false;
   }
-  if (shape.ints >= 1 && record.n1 < shape.n1_min) return false;
-  if (shape.ints >= 2 && record.n2 < shape.n2_min) return false;
+  const int64_t slots[] = {record.n1, record.n2, record.n3};
+  const int first = shape.first_slot();
+  if (shape.ints >= 1 && slots[first] < shape.first_min) return false;
+  if (shape.ints >= 2 && slots[first + 1] < shape.second_min) return false;
   // Fields the layout does not use must be left alone.
-  if (!shape.fresh && shape.ints == 0 && record.n1 != 0) return false;
-  if (shape.ints < 2 && record.n2 != 0) return false;
+  for (int i = 0; i < 3; ++i) {
+    const bool used =
+        (i == 0 && shape.fresh) || (i >= first && i < first + shape.ints);
+    if (!used && slots[i] != 0) return false;
+  }
   return true;
 }
 
@@ -214,7 +230,7 @@ bool HasExpiry(Record::Type type) {
 bool DecodeBody(std::string_view body, bool nested, Record* record) {
   if (body.empty()) return false;
   const uint8_t type = static_cast<uint8_t>(body[0]);
-  if (type < 1 || type > 20) return false;
+  if (type < 1 || type > 22) return false;
   *record = Record();
   record->type = static_cast<Record::Type>(type);
   PayloadReader reader(body.substr(1));
@@ -251,8 +267,10 @@ bool DecodeBody(std::string_view body, bool nested, Record* record) {
         if (!reader.ReadF64(&score)) return false;
       }
     }
-    if (shape->ints >= 1 && !reader.ReadI64(&record->n1)) return false;
-    if (shape->ints >= 2 && !reader.ReadI64(&record->n2)) return false;
+    int64_t* slots[] = {&record->n1, &record->n2, &record->n3};
+    const int first = shape->first_slot();
+    if (shape->ints >= 1 && !reader.ReadI64(slots[first])) return false;
+    if (shape->ints >= 2 && !reader.ReadI64(slots[first + 1])) return false;
     return reader.done() && FitsShape(*shape, *record);
   }
 
@@ -307,7 +325,7 @@ namespace {
 
 // Appends the body (type byte plus payload) of `record` to `body`.
 Status EncodeBody(const Record& record, bool nested, std::string* body) {
-  if (record.type < Record::Type::kSet || record.type > Record::Type::kZRem) {
+  if (record.type < Record::Type::kSet || record.type > Record::Type::kXTrim) {
     return Status(StatusCode::kInvalidArgument, "unknown record type");
   }
   if (record.expires_at_ms.has_value() &&
@@ -345,8 +363,10 @@ Status EncodeBody(const Record& record, bool nested, std::string* body) {
     if (shape->scores) {
       for (double score : record.scores) PutF64(body, score);
     }
-    if (shape->ints >= 1) PutI64(body, record.n1);
-    if (shape->ints >= 2) PutI64(body, record.n2);
+    const int64_t slots[] = {record.n1, record.n2, record.n3};
+    const int first = shape->first_slot();
+    if (shape->ints >= 1) PutI64(body, slots[first]);
+    if (shape->ints >= 2) PutI64(body, slots[first + 1]);
   } else {
     PutString(body, record.key);
     if (HasValue(record.type)) PutString(body, record.value);

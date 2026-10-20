@@ -66,6 +66,8 @@ record := length:u32  crc32:u32  type:u8  payload[length - 1]
 | 18   | SREM    | key, member strings              |
 | 19   | ZADD    | key, fresh, member strings, one score:f64 each |
 | 20   | ZREM    | key, member strings              |
+| 21   | XADD    | key, fresh, payload string, ms:i64, seq:i64 |
+| 22   | XTRIM   | key, ms:i64, seq:i64             |
 
 A BATCH holds other records (any type except BATCH) as members. The members
 share the BATCH's checksum, so the log has all of them or none: a crash that
@@ -92,7 +94,7 @@ stored absolute times, and keys already expired at replay are skipped.
 
 ### Collections
 
-Types 9 to 20 change lists, hashes, sets and sorted sets. They share one
+Types 9 to 22 change lists, hashes, sets and sorted sets. They share one
 layout, described by a single table in the code: after the key come an
 optional *fresh* byte, an optional list of strings (`count:u32` and then that
 many length-prefixed strings), an optional list of scores (8-byte IEEE-754 bit
