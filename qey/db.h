@@ -133,6 +133,10 @@ class Db {
   // Creates an in-memory store that reads time from `now`. Intended for tests.
   explicit Db(NowFn now);
 
+  // Like Db(now), but also reads Unix time from `wall_now`, which gives stream
+  // entries their IDs. Intended for tests.
+  Db(NowFn now, WallNowFn wall_now);
+
   // Opens the persistent store at `path`, creating it if it does not exist,
   // and loads its contents. The file is locked until the Db is destroyed.
   // Fails with kUnavailable if it is already open, kCorruption if the log is
@@ -370,6 +374,54 @@ class Db {
   StatusOr<double> ZIncr(std::string_view key, std::string_view member,
                          double delta = 1);
 
+  // ---- Streams ----
+  //
+  // A stream is an append-only sequence of entries, each an opaque string with
+  // an ID that the store assigns. An ID is the time the entry was added in
+  // milliseconds, and a sequence number for entries within one millisecond;
+  // IDs only grow, even if the clock goes backwards. See
+  // docs/design/streams.md.
+  //
+  // A stream whose entries have all been trimmed stays, and remembers the
+  // newest ID it has held. These fail with kWrongType if the key holds
+  // something other than a stream, and with kInvalidArgument if a key or
+  // payload exceeds its size limit.
+
+  // Appends `payload` and returns its ID, creating the stream if the key is
+  // missing. With `max_len`, then removes the oldest entries beyond the newest
+  // `max_len`, atomically with the append. Fails with kOutOfRange if the
+  // stream's IDs have run out.
+  StatusOr<StreamId> XAdd(std::string_view key, std::string_view payload,
+                          std::optional<size_t> max_len = std::nullopt);
+
+  // The number of entries; 0 for a missing key.
+  StatusOr<size_t> XLen(std::string_view key);
+
+  // The ID of the newest entry the stream has held, or nullopt for a missing
+  // key.
+  StatusOr<std::optional<StreamId>> XLastId(std::string_view key);
+
+  // Up to `count` entries with an ID of at least `from` and, if given, at most
+  // `to`, oldest first. `StreamId{}` starts at the beginning. To continue after
+  // an entry you have, pass its `id.Next()`; to read since a time, pass
+  // `StreamId{ms, 0}`.
+  StatusOr<std::vector<StreamEntry>> XRange(
+      std::string_view key, StreamId from, size_t count,
+      std::optional<StreamId> to = std::nullopt);
+
+  // Up to `count` of the newest entries, newest first, optionally only those
+  // with an ID of at most `before`.
+  StatusOr<std::vector<StreamEntry>> XRevRange(
+      std::string_view key, size_t count,
+      std::optional<StreamId> before = std::nullopt);
+
+  // Removes the oldest entries beyond the newest `max_len`, or the entries
+  // with an ID below `min_id`, and returns how many it removed. A missing key
+  // removes nothing. `min_id` fails with kInvalidArgument if a part of it is
+  // above INT64_MAX.
+  StatusOr<size_t> XTrimMaxLen(std::string_view key, size_t max_len);
+  StatusOr<size_t> XTrimMinId(std::string_view key, StreamId min_id);
+
   // Returns up to `limit` (at least 1) live keys that start with `prefix`, in
   // byte order, starting after `after` (or from the beginning if empty).
   // Passing `ScanPage::next` as `after` continues the scan. Keys are visited
@@ -447,6 +499,7 @@ class Db {
     size_t count = 0;     // a length or a number of elements
     double number = 0;    // the result of a floating-point operation
     std::vector<std::string> items;  // elements removed
+    StreamId id;                     // the ID of an added stream entry
   };
 
   // Transparent hashing lets lookups take a string_view without allocating.
@@ -457,8 +510,6 @@ class Db {
     }
   };
   using Map = std::unordered_map<std::string, Entry, KeyHash, std::equal_to<>>;
-
-  Db(NowFn now, WallNowFn wall_now);
 
   // A reading of both clocks taken together.
   struct ClockPoint {
@@ -568,6 +619,12 @@ class Db {
   // Validates, plans, logs and applies one change. Every single-key mutation
   // goes through this.
   StatusOr<OpResult> Run(const WriteBatch::Op& op);
+
+  // Plans, applies and logs `ops`, already validated, as one unit, as
+  // Write() does. If `results` is not null it receives what each reported.
+  // Requires `mu_` held.
+  Status WriteLocked(const std::vector<WriteBatch::Op>& ops,
+                     std::vector<OpResult>* results);
 
   // Notes the current state of `key` in `undo` unless it is already there.
   void RememberLocked(Undo* undo, std::string_view key);

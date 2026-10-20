@@ -636,6 +636,116 @@ StatusOr<double> Db::ZIncr(std::string_view key, std::string_view member,
   return r->number;
 }
 
+StatusOr<StreamId> Db::XAdd(std::string_view key, std::string_view payload,
+                            std::optional<size_t> max_len) {
+  WriteBatch::Op add =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kXAdd, key, payload);
+  if (!max_len.has_value()) {
+    StatusOr<OpResult> r = Run(add);
+    if (!r.ok()) return r.status();
+    return r->id;
+  }
+  // The add and the trim are logged together, so a crash cannot leave the
+  // stream over its limit.
+  WriteBatch::Op trim =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kXTrimMaxLen, key);
+  trim.n1 = static_cast<int64_t>(std::min<size_t>(*max_len, INT64_MAX));
+  const std::vector<WriteBatch::Op> ops = {std::move(add), std::move(trim)};
+  for (const WriteBatch::Op& op : ops) {
+    Status valid = ValidateOp(op);
+    if (!valid.ok()) return valid;
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<OpResult> results;
+  Status s = WriteLocked(ops, &results);
+  if (!s.ok()) return s;
+  return results[0].id;
+}
+
+StatusOr<size_t> Db::XLen(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kStream, &it);
+  if (!s.ok()) return s;
+  return it == map_.end() ? size_t{0}
+                          : it->second.value.stream().entries.size();
+}
+
+StatusOr<std::optional<StreamId>> Db::XLastId(std::string_view key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kStream, &it);
+  if (!s.ok()) return s;
+  if (it == map_.end()) return std::optional<StreamId>();
+  return std::optional<StreamId>(it->second.value.stream().last_id);
+}
+
+StatusOr<std::vector<StreamEntry>> Db::XRange(std::string_view key,
+                                              StreamId from, size_t count,
+                                              std::optional<StreamId> to) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kStream, &it);
+  if (!s.ok()) return s;
+  std::vector<StreamEntry> out;
+  if (it == map_.end()) return out;
+  const auto& entries = it->second.value.stream().entries;
+  auto position = std::lower_bound(
+      entries.begin(), entries.end(), from,
+      [](const StreamEntry& e, const StreamId& id) { return e.id < id; });
+  for (; position != entries.end() && out.size() < count; ++position) {
+    if (to.has_value() && position->id > *to) break;
+    out.push_back(*position);
+  }
+  return out;
+}
+
+StatusOr<std::vector<StreamEntry>> Db::XRevRange(
+    std::string_view key, size_t count, std::optional<StreamId> before) {
+  std::lock_guard<std::mutex> lock(mu_);
+  Map::iterator it;
+  Status s = FindOfType(key, KeyType::kStream, &it);
+  if (!s.ok()) return s;
+  std::vector<StreamEntry> out;
+  if (it == map_.end()) return out;
+  const auto& entries = it->second.value.stream().entries;
+  // Start at the newest entry that is not after `before`.
+  auto position =
+      before.has_value()
+          ? std::upper_bound(entries.begin(), entries.end(), *before,
+                             [](const StreamId& id, const StreamEntry& e) {
+                               return id < e.id;
+                             })
+          : entries.end();
+  while (position != entries.begin() && out.size() < count) {
+    --position;
+    out.push_back(*position);
+  }
+  return out;
+}
+
+StatusOr<size_t> Db::XTrimMaxLen(std::string_view key, size_t max_len) {
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kXTrimMaxLen, key);
+  op.n1 = static_cast<int64_t>(std::min<size_t>(max_len, INT64_MAX));
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
+StatusOr<size_t> Db::XTrimMinId(std::string_view key, StreamId min_id) {
+  if (min_id.ms > kMaxStreamIdPart || min_id.seq > kMaxStreamIdPart) {
+    return Status(StatusCode::kInvalidArgument, "an ID part is out of range");
+  }
+  WriteBatch::Op op =
+      WriteBatch::MakeOp(WriteBatch::Op::Type::kXTrimMinId, key);
+  op.n1 = static_cast<int64_t>(min_id.ms);
+  op.n2 = static_cast<int64_t>(min_id.seq);
+  StatusOr<OpResult> r = Run(op);
+  if (!r.ok()) return r.status();
+  return r->count;
+}
+
 size_t Db::Sweep(size_t limit) {
   std::lock_guard<std::mutex> lock(mu_);
   const Clock::time_point now = now_();
@@ -711,6 +821,10 @@ Status Db::ValidateOp(const WriteBatch::Op& op) {
   }
   if (std::isnan(op.d)) {
     return Status(StatusCode::kInvalidArgument, "a delta cannot be NaN");
+  }
+  if (op.type == WriteBatch::Op::Type::kXTrimMinId &&
+      (op.n1 < 0 || op.n2 < 0)) {
+    return Status(StatusCode::kInvalidArgument, "an ID part is out of range");
   }
   if (op.type == WriteBatch::Op::Type::kHSet && op.items.size() % 2 != 0) {
     return Status(StatusCode::kInvalidArgument,
@@ -1064,6 +1178,65 @@ Status Db::PlanLocked(const WriteBatch::Op& op, const ClockPoint& ref,
       *record = std::move(r);
       break;
     }
+    case Type::kXAdd: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kStream, &it);
+      if (!s.ok()) return s;
+      const StreamId last =
+          it == map_.end() ? StreamId() : it->second.value.stream().last_id;
+      // The time, but never behind the newest entry, so IDs keep growing if
+      // the clock goes backwards.
+      StreamId id{
+          std::max<uint64_t>(std::max<int64_t>(ref.wall_ms, 0), last.ms), 0};
+      if (id.ms == last.ms) {
+        if (last.seq >= kMaxStreamIdPart) {
+          return Status(StatusCode::kOutOfRange, "the stream's IDs ran out");
+        }
+        id.seq = last.seq + 1;
+      }
+      result->id = id;
+      Record r;
+      r.type = Record::Type::kXAdd;
+      r.key = op.key;
+      r.items = {op.arg};
+      r.n1 = it == map_.end() ? 1 : 0;
+      r.n2 = static_cast<int64_t>(id.ms);
+      r.n3 = static_cast<int64_t>(id.seq);
+      *record = std::move(r);
+      break;
+    }
+    case Type::kXTrimMaxLen:
+    case Type::kXTrimMinId: {
+      Map::iterator it;
+      Status s = FindOfType(op.key, KeyType::kStream, &it);
+      if (!s.ok()) return s;
+      if (it == map_.end()) break;
+      const Stream& stream = it->second.value.stream();
+      const auto& entries = stream.entries;
+      // The smallest ID to keep. Past the newest entry is as good as just
+      // after it, which keeps nothing.
+      StreamId keep_from = stream.last_id.Next();
+      if (op.type == Type::kXTrimMaxLen) {
+        const size_t max_len = static_cast<size_t>(op.n1);
+        if (entries.size() <= max_len) break;
+        if (max_len > 0) keep_from = entries[entries.size() - max_len].id;
+      } else {
+        keep_from = std::min(keep_from, StreamId{static_cast<uint64_t>(op.n1),
+                                                 static_cast<uint64_t>(op.n2)});
+      }
+      const auto first_kept = std::lower_bound(
+          entries.begin(), entries.end(), keep_from,
+          [](const StreamEntry& e, const StreamId& id) { return e.id < id; });
+      if (first_kept == entries.begin()) break;  // nothing is that old
+      result->count = static_cast<size_t>(first_kept - entries.begin());
+      Record r;
+      r.type = Record::Type::kXTrim;
+      r.key = op.key;
+      r.n1 = static_cast<int64_t>(keep_from.ms);
+      r.n2 = static_cast<int64_t>(keep_from.seq);
+      *record = std::move(r);
+      break;
+    }
     case Type::kHIncr: {
       Map::iterator it;
       Status s = FindOfType(op.key, KeyType::kHash, &it);
@@ -1119,6 +1292,11 @@ Status Db::Write(const WriteBatch& batch) {
   }
 
   std::lock_guard<std::mutex> lock(mu_);
+  return WriteLocked(batch.ops_, nullptr);
+}
+
+Status Db::WriteLocked(const std::vector<WriteBatch::Op>& ops,
+                       std::vector<OpResult>* results) {
   MaybeCompactLocked();
   if (storage_ != nullptr) {
     Status healthy = CheckHealthyLocked();
@@ -1131,14 +1309,15 @@ Status Db::Write(const WriteBatch& batch) {
   Undo undo;
   std::vector<Record> effective;
   const ClockPoint ref = ReadClocks();  // one instant for the whole batch
-  for (const WriteBatch::Op& op : batch.ops_) {
+  for (const WriteBatch::Op& op : ops) {
     std::optional<Record> record;
-    OpResult unused;
-    Status s = PlanLocked(op, ref, &record, &unused);
+    OpResult result;
+    Status s = PlanLocked(op, ref, &record, &result);
     if (!s.ok()) {
       RollbackLocked(std::move(undo));
       return s;
     }
+    if (results != nullptr) results->push_back(std::move(result));
     if (!record.has_value()) continue;
 
     RememberLocked(&undo, record->key);
@@ -1497,6 +1676,40 @@ Status Db::WriteEntryRecords(const std::string& key, const Entry& entry,
       if (!s.ok()) return s;
       break;
     }
+    case KeyType::kStream: {
+      const Stream& stream = value.stream();
+      Record add;
+      add.type = Record::Type::kXAdd;
+      add.key = key;
+      add.n1 = 1;  // the first record starts the stream
+      Status s = Status::Ok();
+      for (const StreamEntry& e : stream.entries) {
+        add.items = {e.payload};
+        add.n2 = static_cast<int64_t>(e.id.ms);
+        add.n3 = static_cast<int64_t>(e.id.seq);
+        s = emit(add);
+        if (!s.ok()) return s;
+        add.n1 = 0;
+      }
+      if (stream.entries.empty()) {
+        // Nothing to keep, but the newest ID has to survive: add an entry
+        // with that ID and trim it away again.
+        add.items = {""};
+        add.n2 = static_cast<int64_t>(stream.last_id.ms);
+        add.n3 = static_cast<int64_t>(stream.last_id.seq);
+        s = emit(add);
+        if (!s.ok()) return s;
+        Record trim;
+        trim.type = Record::Type::kXTrim;
+        trim.key = key;
+        const StreamId after = stream.last_id.Next();
+        trim.n1 = static_cast<int64_t>(after.ms);
+        trim.n2 = static_cast<int64_t>(after.seq);
+        s = emit(trim);
+        if (!s.ok()) return s;
+      }
+      break;
+    }
     default:
       return Status(StatusCode::kInvalidArgument, "unsupported value type");
   }
@@ -1700,10 +1913,43 @@ void Db::ApplyRecordLocked(Record&& record, const ClockPoint& ref) {
         ApplyRecordLocked(std::move(member), ref);
       }
       break;
-    case Record::Type::kXAdd:
-    case Record::Type::kXTrim:
-      // The Db does not have streams yet. Nothing writes these records.
+    case Record::Type::kXAdd: {
+      const StreamId id{static_cast<uint64_t>(record.n2),
+                        static_cast<uint64_t>(record.n3)};
+      Map::iterator it;
+      if (record.n1 == 1) {
+        if (!(id > StreamId())) break;
+        it = InsertLocked(record.key);
+        ClearExpiryLocked(it);
+        it->second.value = Value::Make(KeyType::kStream);
+      } else {
+        const bool existed = map_.find(record.key) != map_.end();
+        it = CollectionLocked(record.key, KeyType::kStream, /*create=*/true);
+        if (it == map_.end()) break;
+        if (!(id > it->second.value.stream().last_id)) {
+          // Not a newer ID, so the record does not fit the stream. Leave it
+          // as it was, without a stream that was only just made for it.
+          if (!existed) EraseLocked(it);
+          break;
+        }
+      }
+      Stream& stream = it->second.value.stream();
+      stream.entries.push_back({id, std::move(record.items[0])});
+      stream.last_id = id;
       break;
+    }
+    case Record::Type::kXTrim: {
+      auto it =
+          CollectionLocked(record.key, KeyType::kStream, /*create=*/false);
+      if (it == map_.end()) break;
+      const StreamId keep_from{static_cast<uint64_t>(record.n1),
+                               static_cast<uint64_t>(record.n2)};
+      auto& entries = it->second.value.stream().entries;
+      while (!entries.empty() && entries.front().id < keep_from) {
+        entries.pop_front();
+      }
+      break;
+    }
   }
 }
 

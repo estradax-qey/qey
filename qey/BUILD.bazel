@@ -60,6 +60,15 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "db_stream_test",
+    srcs = ["db_stream_test.cc"],
+    deps = [
+        ":db",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "crc32",
     srcs = ["crc32.cc"],

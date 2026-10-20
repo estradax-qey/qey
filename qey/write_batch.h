@@ -203,6 +203,9 @@ class WriteBatch {
       kZAdd,
       kZRem,
       kZIncr,
+      kXAdd,
+      kXTrimMaxLen,
+      kXTrimMinId,
     };
 
     Type type = Type::kSet;
@@ -211,12 +214,16 @@ class WriteBatch {
     std::string arg;
     std::optional<std::chrono::milliseconds> ttl;  // kSet, kExpire.
     // kHSet: fields and values, alternating. kHDel: the fields. kLPush and
-    // kRPush: the values. kSAdd and kSRem: the members.
+    // kRPush: the values. kSAdd and kSRem: the members. kXAdd: `arg` is the
+    // payload.
     std::vector<std::string> items;
     // kIncr, kDecr, kHIncr: the delta. kLPop, kRPop: how many. kLSet: the
-    // index. kLTrim: the first index to keep.
+    // index. kLTrim: the first index to keep. kXTrimMaxLen: the most entries
+    // to keep. kXTrimMinId: the milliseconds of the smallest ID to keep.
     int64_t n1 = 0;
-    int64_t n2 = 0;  // kLTrim: the last index to keep.
+    // kLTrim: the last index to keep. kXTrimMinId: the sequence number of the
+    // smallest ID to keep.
+    int64_t n2 = 0;
     // kZAdd: the score of each member in `items`. kZIncr: `d` is the delta.
     std::vector<double> scores;
     double d = 0;
