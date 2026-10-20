@@ -158,6 +158,22 @@ Result Pair(const std::string& a, Result b) {
   return pair;
 }
 
+// A stream ID such as "1760000000000-3", or a bare millisecond time.
+std::optional<StreamId> ParseStreamId(const std::string& text) {
+  return StreamId::Parse(text);
+}
+
+Result Entries(const std::vector<StreamEntry>& entries) {
+  Result out = Result::Array();
+  for (const StreamEntry& e : entries) {
+    Result entry = Result::Object();
+    entry.fields.emplace_back("id", Result::String(e.id.ToString()));
+    entry.fields.emplace_back("value", Result::String(e.payload));
+    out.items.push_back(std::move(entry));
+  }
+  return out;
+}
+
 // The arguments from `first` on.
 std::vector<std::string> Rest(const Invocation& inv, size_t first) {
   return std::vector<std::string>(
@@ -392,6 +408,39 @@ const std::map<std::string, BatchBuilder>& BatchBuilders() {
          b.ZIncr(a[0], a[1], *delta);
          return std::nullopt;
        }},
+      {"xadd",
+       [](WriteBatch& b,
+          const std::vector<std::string>& a) -> std::optional<std::string> {
+         if (auto e = NeedArgs(a, 2, 2, "xadd <key> <payload>")) return e;
+         b.XAdd(a[0], a[1]);
+         return std::nullopt;
+       }},
+      {"xtrim",
+       [](WriteBatch& b,
+          const std::vector<std::string>& a) -> std::optional<std::string> {
+         if (auto e = NeedArgs(a, 3, 3,
+                               "xtrim <key> maxlen <count> | xtrim <key> "
+                               "minid <id>")) {
+           return e;
+         }
+         if (a[1] == "maxlen") {
+           auto max_len = ParseCount(a[2]);
+           if (!max_len) {
+             return "maxlen must be a non-negative integer, got \"" + a[2] +
+                    "\"";
+           }
+           b.XTrimMaxLen(a[0], *max_len);
+         } else if (a[1] == "minid") {
+           auto id = ParseStreamId(a[2]);
+           if (!id)
+             return "minid must look like 1760000000000-0, got \"" + a[2] +
+                    "\"";
+           b.XTrimMinId(a[0], *id);
+         } else {
+           return "xtrim takes maxlen or minid, got \"" + a[1] + "\"";
+         }
+         return std::nullopt;
+       }},
   };
   return kBuilders;
 }
@@ -522,7 +571,7 @@ std::vector<CommandSpec> BuildCommands() {
        }});
   add({"type",
        "type <key>",
-       "Print none, string, list, hash, set or zset.",
+       "Print none, string, list, hash, set, zset or stream.",
        false,
        1,
        1,
@@ -1130,6 +1179,176 @@ std::vector<CommandSpec> BuildCommands() {
        {},
        false,
        [](Invocation& inv) { return Wrap(inv.db->Clear()); }});
+  // ---- Streams
+  add({"xadd",
+       "xadd <key> <payload> [--maxlen N]  |  xadd <key> --stdin [--maxlen N]",
+       "Append an entry to a stream and print its ID (milliseconds-sequence). "
+       "With --maxlen, then keep only the newest N entries.",
+       true,
+       1,
+       2,
+       {{"--maxlen", true}, {"--stdin", false}},
+       false,
+       [](Invocation& inv) {
+         const bool from_stdin = inv.options.count("--stdin") > 0;
+         if (from_stdin ? inv.args.size() != 1 : inv.args.size() != 2) {
+           return Outcome::Usage(
+               from_stdin ? "with --stdin, give only the key"
+                          : "xadd needs a key and a payload (or --stdin)");
+         }
+         std::optional<size_t> max_len;
+         if (auto it = inv.options.find("--maxlen"); it != inv.options.end()) {
+           max_len = ParseCount(it->second);
+           if (!max_len) {
+             return BadValue("--maxlen", it->second, "a non-negative integer");
+           }
+         }
+         std::string payload;
+         if (from_stdin) {
+           payload.assign(std::istreambuf_iterator<char>(*inv.in),
+                          std::istreambuf_iterator<char>());
+         } else {
+           payload = inv.args[1];
+         }
+         StatusOr<StreamId> id = inv.db->XAdd(inv.args[0], payload, max_len);
+         if (!id.ok()) return Outcome::FromStatus(id.status());
+         return Done(Result::String(id->ToString()));
+       }});
+  add({"xlen",
+       "xlen <key>",
+       "Print the number of entries in a stream.",
+       false,
+       1,
+       1,
+       {},
+       false,
+       [](Invocation& inv) { return Wrap(inv.db->XLen(inv.args[0])); }});
+  add({"xlastid",
+       "xlastid <key>",
+       "Print the ID of the newest entry the stream has held, even if it has "
+       "been trimmed away.",
+       false,
+       1,
+       1,
+       {},
+       false,
+       [](Invocation& inv) {
+         StatusOr<std::optional<StreamId>> r = inv.db->XLastId(inv.args[0]);
+         if (!r.ok()) return Outcome::FromStatus(r.status());
+         return Done(r->has_value() ? Result::String((*r)->ToString())
+                                    : Result::Nil());
+       }});
+  add({"xrange",
+       "xrange <key> --count N [--from ID | --after ID] [--to ID]",
+       "Print up to N entries, oldest first, as ID and value. --from is "
+       "inclusive and takes an ID or just a time in milliseconds; --after "
+       "starts after an ID, to continue where you left off; --to is "
+       "inclusive.",
+       false,
+       1,
+       1,
+       {{"--count", true}, {"--from", true}, {"--after", true}, {"--to", true}},
+       false,
+       [](Invocation& inv) {
+         auto count_it = inv.options.find("--count");
+         if (count_it == inv.options.end()) {
+           return Outcome::Usage("xrange needs --count N");
+         }
+         std::optional<size_t> count = ParseCount(count_it->second);
+         if (!count) {
+           return BadValue("--count", count_it->second,
+                           "a non-negative integer");
+         }
+         if (inv.options.count("--from") > 0 &&
+             inv.options.count("--after") > 0) {
+           return Outcome::Usage("give --from or --after, not both");
+         }
+         StreamId from;
+         for (const char* name : {"--from", "--after"}) {
+           auto it = inv.options.find(name);
+           if (it == inv.options.end()) continue;
+           std::optional<StreamId> id = ParseStreamId(it->second);
+           if (!id) {
+             return BadValue(name, it->second, "an ID such as 1760000000000-0");
+           }
+           from = std::string_view(name) == "--after" ? id->Next() : *id;
+         }
+         std::optional<StreamId> to;
+         if (auto it = inv.options.find("--to"); it != inv.options.end()) {
+           to = ParseStreamId(it->second);
+           if (!to) {
+             return BadValue("--to", it->second,
+                             "an ID such as 1760000000000-0");
+           }
+         }
+         StatusOr<std::vector<StreamEntry>> r =
+             inv.db->XRange(inv.args[0], from, *count, to);
+         if (!r.ok()) return Outcome::FromStatus(r.status());
+         return Done(Entries(*r));
+       }});
+  add({"xrevrange",
+       "xrevrange <key> --count N [--before ID]",
+       "Print the newest N entries, newest first, as ID and value. --before "
+       "is inclusive.",
+       false,
+       1,
+       1,
+       {{"--count", true}, {"--before", true}},
+       false,
+       [](Invocation& inv) {
+         auto count_it = inv.options.find("--count");
+         if (count_it == inv.options.end()) {
+           return Outcome::Usage("xrevrange needs --count N");
+         }
+         std::optional<size_t> count = ParseCount(count_it->second);
+         if (!count) {
+           return BadValue("--count", count_it->second,
+                           "a non-negative integer");
+         }
+         std::optional<StreamId> before;
+         if (auto it = inv.options.find("--before"); it != inv.options.end()) {
+           before = ParseStreamId(it->second);
+           if (!before) {
+             return BadValue("--before", it->second,
+                             "an ID such as 1760000000000-0");
+           }
+         }
+         StatusOr<std::vector<StreamEntry>> r =
+             inv.db->XRevRange(inv.args[0], *count, before);
+         if (!r.ok()) return Outcome::FromStatus(r.status());
+         return Done(Entries(*r));
+       }});
+  add({"xtrim",
+       "xtrim <key> --maxlen N  |  xtrim <key> --minid ID",
+       "Remove the oldest entries: keep only the newest N, or only those with "
+       "an ID of at least ID. Prints how many were removed. The stream stays "
+       "and remembers its last ID.",
+       true,
+       1,
+       1,
+       {{"--maxlen", true}, {"--minid", true}},
+       false,
+       [](Invocation& inv) {
+         const auto max_it = inv.options.find("--maxlen");
+         const auto min_it = inv.options.find("--minid");
+         if ((max_it == inv.options.end()) == (min_it == inv.options.end())) {
+           return Outcome::Usage("give exactly one of --maxlen and --minid");
+         }
+         if (max_it != inv.options.end()) {
+           std::optional<size_t> max_len = ParseCount(max_it->second);
+           if (!max_len) {
+             return BadValue("--maxlen", max_it->second,
+                             "a non-negative integer");
+           }
+           return Wrap(inv.db->XTrimMaxLen(inv.args[0], *max_len));
+         }
+         std::optional<StreamId> id = ParseStreamId(min_it->second);
+         if (!id) {
+           return BadValue("--minid", min_it->second,
+                           "an ID such as 1760000000000-0");
+         }
+         return Wrap(inv.db->XTrimMinId(inv.args[0], *id));
+       }});
   add({"stats",
        "stats",
        "Print the number of keys by type, the file size, and what opening "
@@ -1141,7 +1360,8 @@ std::vector<CommandSpec> BuildCommands() {
        false,
        [](Invocation& inv) {
          std::map<std::string, int64_t> by_type = {
-             {"string", 0}, {"list", 0}, {"hash", 0}, {"set", 0}, {"zset", 0}};
+             {"string", 0}, {"list", 0}, {"hash", 0},
+             {"set", 0},    {"zset", 0}, {"stream", 0}};
          int64_t keys = 0;
          for (const std::string& key : inv.db->Keys()) {
            ++by_type[std::string(TypeName(inv.db->Type(key)))];
@@ -1150,7 +1370,8 @@ std::vector<CommandSpec> BuildCommands() {
          std::error_code ec;
          const auto size = std::filesystem::file_size(inv.db_path, ec);
          Result types = Result::Object();
-         for (const char* name : {"string", "list", "hash", "set", "zset"}) {
+         for (const char* name :
+              {"string", "list", "hash", "set", "zset", "stream"}) {
            types.fields.emplace_back(name, Result::Int(by_type[name]));
          }
          const RecoveryInfo recovery = inv.db->recovery_info();

@@ -97,9 +97,16 @@ void WriteScalar(const Result& r, std::ostream& out) {
       }
       break;
     }
-    case Kind::kObject:
-      out << "{...}";
+    case Kind::kObject: {
+      // A record in a list, such as a stream entry: its values joined by tabs.
+      bool first = true;
+      for (const auto& field : r.fields) {
+        if (!first) out << '\t';
+        first = false;
+        WriteScalar(field.second, out);
+      }
       break;
+    }
   }
 }
 

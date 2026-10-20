@@ -140,5 +140,19 @@ TEST(RenderTest, ObjectsKeepFieldOrder) {
             "name: qey\nlist:\n  a\n  b\nnested:\n  x: 1\nnone: (nil)\n");
 }
 
+TEST(RenderTest, RecordsInAListPrintTheirValuesOnATabbedLine) {
+  Result list = Result::Array();
+  for (const char* value : {"hi", "there"}) {
+    Result entry = Result::Object();
+    entry.fields.emplace_back("id", Result::String("5-0"));
+    entry.fields.emplace_back("value", Result::String(value));
+    list.items.push_back(entry);
+  }
+  EXPECT_EQ(Text(list), "5-0\thi\n5-0\tthere\n");
+  EXPECT_EQ(Json(list),
+            "[{\"id\":\"5-0\",\"value\":\"hi\"},"
+            "{\"id\":\"5-0\",\"value\":\"there\"}]\n");
+}
+
 }  // namespace
 }  // namespace qey::cli

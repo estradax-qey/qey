@@ -94,6 +94,18 @@ expect_eq "batch results" "-2
 2
 paid" "$out"
 
+# Streams: append, read back, and resume after an entry.
+run xadd chat '{"role":"user","content":"hi"}'
+expect_eq "xadd exit code" 0 "$code"
+first="$out"
+run xadd chat '{"role":"assistant","content":"hello"}'
+second="$out"
+run --json xrange chat --count 10 --after "$first"
+expect_eq "xrange after" '{"ok":true,"result":[{"id":"'"$second"'","value":"{\"role\":\"assistant\",\"content\":\"hello\"}"}]}' "$out"
+run xtrim chat --maxlen 0
+run xlastid chat
+expect_eq "a trimmed stream remembers its last id" "$second" "$out"
+
 # An agent can discover the commands.
 run --json commands
 case "$out" in '{"ok":true,"result":[{"name":"get"'*) ;; *) fail "commands: $out" ;; esac

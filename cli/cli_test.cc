@@ -1,5 +1,6 @@
 #include "cli/cli.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -439,8 +440,9 @@ TEST_F(CliTest, EveryBatchableCommandWorksInABatch) {
 }
 
 TEST_F(CliTest, ReadCommandsDoNotCreateTheFile) {
-  for (const char* cmd : {"get", "exists", "type", "ttl", "keys", "hlen",
-                          "llen", "scard", "zcard", "stats"}) {
+  for (const char* cmd :
+       {"get", "exists", "type", "ttl", "keys", "hlen", "llen", "scard",
+        "zcard", "xlen", "xlastid", "stats"}) {
     std::vector<std::string> args = {cmd};
     if (std::string(cmd) != "keys" && std::string(cmd) != "stats")
       args.push_back("k");
@@ -501,7 +503,7 @@ TEST_F(CliTest, StatsDescribesTheDatabase) {
   EXPECT_EQ(r.code, 0);
   EXPECT_NE(r.out.find("\"keys\":5"), std::string::npos) << r.out;
   EXPECT_NE(r.out.find("\"types\":{\"string\":1,\"list\":1,\"hash\":1,\"set\":"
-                       "1,\"zset\":1}"),
+                       "1,\"zset\":1,\"stream\":0}"),
             std::string::npos)
       << r.out;
   EXPECT_NE(r.out.find("\"file_bytes\":" +
@@ -596,6 +598,217 @@ TEST_F(CliTest, NoCommandReadsInputUnlessAskedTo) {
     }
     EXPECT_EQ(Q(args).code, 0) << cmd;
   }
+}
+
+// An ID as printed: milliseconds, a dash, a sequence number.
+bool LooksLikeId(const std::string& text) {
+  const size_t dash = text.find('-');
+  if (dash == std::string::npos || dash == 0 || dash + 1 >= text.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (i != dash && !std::isdigit(static_cast<unsigned char>(text[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Splits "id\tvalue\n" lines into IDs and values.
+void SplitEntries(const std::string& out, std::vector<std::string>* ids,
+                  std::vector<std::string>* values) {
+  std::istringstream lines(out);
+  std::string line;
+  while (std::getline(lines, line)) {
+    const size_t tab = line.find('\t');
+    ASSERT_NE(tab, std::string::npos) << line;
+    ids->push_back(line.substr(0, tab));
+    values->push_back(line.substr(tab + 1));
+  }
+}
+
+TEST_F(CliTest, StreamsAddReadAndPage) {
+  std::vector<std::string> ids;
+  for (const char* payload : {"one", "two", "three", "four"}) {
+    Run_ r = Q({"xadd", "s", payload});
+    ASSERT_EQ(r.code, 0) << r.err;
+    ASSERT_EQ(r.out.back(), '\n');
+    ids.push_back(r.out.substr(0, r.out.size() - 1));
+    EXPECT_TRUE(LooksLikeId(ids.back())) << r.out;
+  }
+  for (size_t i = 1; i < ids.size(); ++i) {
+    EXPECT_NE(ids[i], ids[i - 1]);
+  }
+  EXPECT_EQ(Q({"type", "s"}).out, "stream\n");
+  EXPECT_EQ(Q({"xlen", "s"}).out, "4\n");
+  EXPECT_EQ(Q({"xlastid", "s"}).out, ids.back() + "\n");
+  EXPECT_EQ(Q({"xlastid", "nope"}).out, "(nil)\n");
+  EXPECT_EQ(Q({"xlen", "nope"}).out, "0\n");
+
+  // Text: one "id<TAB>value" line per entry, oldest first.
+  std::vector<std::string> got_ids, values;
+  SplitEntries(Q({"xrange", "s", "--count", "10"}).out, &got_ids, &values);
+  EXPECT_EQ(got_ids, ids);
+  EXPECT_EQ(values, (std::vector<std::string>{"one", "two", "three", "four"}));
+
+  // JSON: objects with the ID as a string.
+  EXPECT_EQ(J({"xrange", "s", "--count", "1"}).out,
+            "{\"ok\":true,\"result\":[{\"id\":\"" + ids[0] +
+                "\",\"value\":\"one\"}]}\n");
+
+  // Resume after an entry, inclusive from, and to.
+  got_ids.clear();
+  values.clear();
+  SplitEntries(Q({"xrange", "s", "--count", "10", "--after", ids[1]}).out,
+               &got_ids, &values);
+  EXPECT_EQ(values, (std::vector<std::string>{"three", "four"}));
+  got_ids.clear();
+  values.clear();
+  SplitEntries(
+      Q({"xrange", "s", "--count", "10", "--from", ids[1], "--to", ids[2]}).out,
+      &got_ids, &values);
+  EXPECT_EQ(values, (std::vector<std::string>{"two", "three"}));
+  EXPECT_EQ(Q({"xrange", "s", "--count", "2"}).out,
+            ids[0] + "\tone\n" + ids[1] + "\ttwo\n");
+  EXPECT_EQ(Q({"xrange", "s", "--count", "0"}).out, "");
+  EXPECT_EQ(Q({"xrange", "s", "--count", "5", "--from", "0"}).code, 0);
+  EXPECT_EQ(Q({"xrange", "nope", "--count", "5"}).out, "");
+
+  // The newest first.
+  got_ids.clear();
+  values.clear();
+  SplitEntries(Q({"xrevrange", "s", "--count", "2"}).out, &got_ids, &values);
+  EXPECT_EQ(values, (std::vector<std::string>{"four", "three"}));
+  got_ids.clear();
+  values.clear();
+  SplitEntries(Q({"xrevrange", "s", "--count", "5", "--before", ids[1]}).out,
+               &got_ids, &values);
+  EXPECT_EQ(values, (std::vector<std::string>{"two", "one"}));
+}
+
+TEST_F(CliTest, StreamArgumentsAreCheckedBeforeAnythingChanges) {
+  ASSERT_EQ(Q({"xadd", "s", "a"}).code, 0);
+  for (const std::vector<std::string>& bad :
+       std::vector<std::vector<std::string>>{
+           {"xrange", "s"},                   // no --count
+           {"xrange", "s", "--count", "x"},   // not a number
+           {"xrange", "s", "--count", "-1"},  // negative
+           {"xrange", "s", "--count", "5", "--from", "abc"},
+           {"xrange", "s", "--count", "5", "--from", "1-2-3"},
+           {"xrange", "s", "--count", "5", "--to", "-1"},
+           {"xrange", "s", "--count", "5", "--from", "1", "--after", "1"},
+           {"xrevrange", "s"},
+           {"xrevrange", "s", "--count", "5", "--before", "x"},
+           {"xadd", "s", "p", "--maxlen", "x"},
+           {"xadd", "s"},                                      // no payload
+           {"xadd", "s", "p", "--stdin"},                      // both
+           {"xtrim", "s"},                                     // neither
+           {"xtrim", "s", "--maxlen", "1", "--minid", "1-0"},  // both
+           {"xtrim", "s", "--maxlen", "-1"},
+           {"xtrim", "s", "--minid", "9223372036854775808-0"},  // too big
+       }) {
+    Run_ r = Q(bad);
+    EXPECT_EQ(r.code, 1) << bad[0] << " " << r.err;
+  }
+  EXPECT_EQ(Q({"xlen", "s"}).out, "1\n");
+}
+
+TEST_F(CliTest, XaddKeepsOnlyTheNewestWithMaxlen) {
+  for (const char* p : {"a", "b", "c", "d"}) {
+    ASSERT_EQ(Q({"xadd", "s", p, "--maxlen", "2"}).code, 0);
+  }
+  EXPECT_EQ(Q({"xlen", "s"}).out, "2\n");
+  std::vector<std::string> ids, values;
+  SplitEntries(Q({"xrange", "s", "--count", "9"}).out, &ids, &values);
+  EXPECT_EQ(values, (std::vector<std::string>{"c", "d"}));
+}
+
+TEST_F(CliTest, XaddReadsAPayloadFromStandardInput) {
+  // A JSONL line with a newline and binary bytes survives exactly.
+  const std::string payload =
+      "{\"role\":\"user\",\"x\":\"\xff\"}\nsecond line\n";
+  ASSERT_EQ(Q({"xadd", "s", "--stdin"}, payload).code, 0);
+  Run_ r = J({"xrange", "s", "--count", "1"});
+  EXPECT_NE(r.out.find("\"base64\""), std::string::npos) << r.out;  // not UTF-8
+  const std::string utf8 = "{\"role\":\"user\"}\nline two";
+  ASSERT_EQ(Q({"xadd", "t", "--stdin"}, utf8).code, 0);
+  Run_ t = J({"xrange", "t", "--count", "1"});
+  EXPECT_NE(t.out.find("\"value\":\"{\\\"role\\\":\\\"user\\\"}\\nline two\""),
+            std::string::npos)
+      << t.out;
+  EXPECT_EQ(Q({"xadd", "t", "x", "--stdin"}, "y").code, 1);  // key only
+}
+
+TEST_F(CliTest, TrimmedStreamsStayAndRememberTheirLastId) {
+  std::string last;
+  for (const char* p : {"a", "b", "c", "d", "e"}) {
+    Run_ r = Q({"xadd", "s", p});
+    last = r.out.substr(0, r.out.size() - 1);
+  }
+  EXPECT_EQ(Q({"xtrim", "s", "--maxlen", "3"}).out, "2\n");
+  EXPECT_EQ(Q({"xtrim", "s", "--maxlen", "3"}).out, "0\n");
+  EXPECT_EQ(J({"xtrim", "s", "--minid", last}).out,
+            "{\"ok\":true,\"result\":2}\n");
+  EXPECT_EQ(Q({"xlen", "s"}).out, "1\n");
+  EXPECT_EQ(Q({"xtrim", "s", "--maxlen", "0"}).out, "1\n");
+  EXPECT_EQ(Q({"xlen", "s"}).out, "0\n");
+  EXPECT_EQ(Q({"type", "s"}).out, "stream\n");  // still there
+  EXPECT_EQ(Q({"xlastid", "s"}).out, last + "\n");
+  EXPECT_EQ(Q({"xtrim", "nope", "--maxlen", "1"}).out, "0\n");
+}
+
+TEST_F(CliTest, StreamsAndOtherTypesAreKeptApart) {
+  ASSERT_EQ(Q({"set", "str", "v"}).code, 0);
+  Run_ r = J({"xadd", "str", "x"});
+  EXPECT_EQ(r.code, 2);
+  EXPECT_NE(r.out.find("WRONG_TYPE"), std::string::npos) << r.out;
+  EXPECT_EQ(Q({"xlen", "str"}).code, 2);
+  EXPECT_EQ(Q({"xrange", "str", "--count", "1"}).code, 2);
+
+  ASSERT_EQ(Q({"xadd", "s", "a"}).code, 0);
+  EXPECT_EQ(Q({"get", "s"}).code, 2);  // not nil: it is a stream
+  EXPECT_EQ(Q({"lpush", "s", "x"}).code, 2);
+  EXPECT_EQ(Q({"del", "s"}).out, "1\n");
+  EXPECT_EQ(Q({"exists", "s"}).out, "false\n");
+}
+
+TEST_F(CliTest, StreamsInABatch) {
+  ASSERT_EQ(Q({"set", "text", "abc"}).code, 0);
+  Run_ ok = J({"batch", "xadd", "s", "hello", "--", "xadd", "s", "world", "--",
+               "incr", "count", "--", "xtrim", "s", "maxlen", "1"});
+  EXPECT_EQ(ok.code, 0) << ok.out << ok.err;
+  EXPECT_EQ(ok.out, "{\"ok\":true,\"result\":{\"applied\":4}}\n");
+  std::vector<std::string> ids, values;
+  SplitEntries(Q({"xrange", "s", "--count", "9"}).out, &ids, &values);
+  EXPECT_EQ(values, std::vector<std::string>{"world"});
+  EXPECT_EQ(Q({"get", "count"}).out, "1\n");
+
+  Run_ minid = Q({"batch", "xadd", "s", "later", "--", "xtrim", "s", "minid",
+                  "9999999999999-0"});
+  EXPECT_EQ(minid.code, 0) << minid.err;
+  EXPECT_EQ(Q({"xlen", "s"}).out, "0\n");
+
+  // A failing change undoes the stream change before it.
+  Run_ failing = Q({"batch", "xadd", "s", "never", "--", "incr", "text"});
+  EXPECT_EQ(failing.code, 2);
+  EXPECT_EQ(Q({"xlen", "s"}).out, "0\n");
+
+  EXPECT_EQ(Q({"batch", "xadd", "s"}).code, 1);
+  EXPECT_EQ(Q({"batch", "xtrim", "s", "maxlen", "x"}).code, 1);
+  EXPECT_EQ(Q({"batch", "xtrim", "s", "other", "1"}).code, 1);
+  EXPECT_EQ(Q({"batch", "xtrim", "s", "minid", "junk"}).code, 1);
+  EXPECT_EQ(Q({"batch", "xrange", "s"}).code, 1);  // reads cannot be batched
+}
+
+TEST_F(CliTest, StreamsPersistBetweenInvocations) {
+  ASSERT_EQ(Q({"xadd", "s", "a"}).code, 0);
+  const std::string id = Q({"xadd", "s", "b"}).out;
+  ASSERT_EQ(Q({"expire", "s", "1h"}).code, 0);
+  EXPECT_EQ(Q({"xlastid", "s"}).out, id);
+  EXPECT_EQ(Q({"xlen", "s"}).out, "2\n");
+  EXPECT_GT(std::stoll(Q({"ttl", "s"}).out), 0);
+  Run_ stats = J({"stats"});
+  EXPECT_NE(stats.out.find("\"stream\":1"), std::string::npos) << stats.out;
 }
 
 }  // namespace
