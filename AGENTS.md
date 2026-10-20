@@ -68,6 +68,21 @@ Follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.
 - Breaking changes use `!` after the type/scope or a `BREAKING CHANGE:` footer.
 - One logical change per commit.
 
+## Releases
+
+Versions follow [Semantic Versioning](https://semver.org/); until 1.0 a minor
+version may change the API. To release:
+
+1. Pick the version and set it in `MODULE.bazel` and `kVersion` in
+   `cli/cli.cc`, and add a `## [X.Y.Z] - date` section to `CHANGELOG.md`.
+   `.github/scripts/check-version.sh` checks all three, and CI runs it.
+2. Merge, then tag the commit and push the tag: `git tag vX.Y.Z && git push
+   origin vX.Y.Z`. The `release` workflow builds the CLI for Linux and macOS,
+   and publishes the archives, checksums and the changelog section as a GitHub
+   release.
+3. To test the workflow without publishing, run it by hand (`gh workflow run
+   release.yml`); that builds everything and publishes nothing.
+
 ## Layout
 
 - `qey/` - the library: the store (`db`), the log format (`log`), storage

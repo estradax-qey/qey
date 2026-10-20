@@ -1,0 +1,126 @@
+name: release
+
+# Pushing a tag such as v0.1.0 builds the command-line tool for each platform
+# and publishes a GitHub release with the archives and their checksums. Running
+# the workflow by hand is a dry run: it builds and tests everything and
+# publishes nothing.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the version is the same everywhere
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            .github/scripts/check-version.sh "$GITHUB_REF_NAME"
+          else
+            .github/scripts/check-version.sh
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so that the binary runs on any glibc from
+          # 2.35 on. The C++ runtime is linked in, so it need not be installed.
+          - target: linux-x86_64
+            os: ubuntu-22.04
+            flags: --linkopt=-static-libstdc++ --linkopt=-static-libgcc
+          - target: linux-arm64
+            os: ubuntu-22.04-arm
+            flags: --linkopt=-static-libstdc++ --linkopt=-static-libgcc
+          - target: macos-arm64
+            os: macos-latest
+            flags: --macos_minimum_os=12.0
+          # Cross-compiled on the arm64 runner. Run under Rosetta if it is
+          # there, to smoke-test it.
+          - target: macos-x86_64
+            os: macos-latest
+            flags: --macos_cpus=x86_64 --macos_minimum_os=12.0
+            exec: arch -x86_64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: release-${{ matrix.target }}
+          repository-cache: true
+      - name: Build
+        run: bazel build -c opt --strip=always ${{ matrix.flags }} //cli:qey
+      - name: Smoke test
+        env:
+          EXEC: ${{ matrix.exec }}
+        run: |
+          bin=bazel-bin/cli/qey
+          file "$bin"
+          if [ -n "$EXEC" ] && ! $EXEC /usr/bin/true 2>/dev/null; then
+            echo "cannot run a ${{ matrix.target }} binary on this runner; skipping"
+            exit 0
+          fi
+          db="$RUNNER_TEMP/smoke.qey"
+          $EXEC "$bin" --version
+          $EXEC "$bin" --db "$db" set greeting hello
+          test "$($EXEC "$bin" --db "$db" get greeting)" = hello
+          $EXEC "$bin" --db "$db" xadd s '{"role":"user"}'
+          test "$($EXEC "$bin" --db "$db" xlen s)" = 1
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="dev"
+          name="qey-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp -L bazel-bin/cli/qey LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          rm -rf "dist/$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qey-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qey-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          cat ./*.sha256 > checksums.txt
+          rm ./*.sha256
+          cd ..
+          .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "qey $GITHUB_REF_NAME" --notes-file notes.md --verify-tag $flags

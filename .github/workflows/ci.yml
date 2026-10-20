@@ -25,6 +25,14 @@ jobs:
           pipx run clang-format==17.0.6 --version
           git ls-files '*.cc' '*.h' | xargs pipx run clang-format==17.0.6 --dry-run --Werror
 
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that the version is the same everywhere
+        run: .github/scripts/check-version.sh
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -41,6 +49,30 @@ jobs:
           repository-cache: true
       - name: Build and test
         run: bazel test //... --test_output=errors
+      # A separate project that depends on qey as a Bazel module.
+      - name: Build the example project
+        working-directory: examples/bazel
+        run: bazel run //:app
+
+  # The pinned Bazel is 8; consumers may be on 9, which removed the built-in C++
+  # rules, so check that qey builds there too.
+  bazel9:
+    name: bazel 9
+    runs-on: ubuntu-latest
+    env:
+      USE_BAZEL_VERSION: 9.x
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-bazel9
+          repository-cache: true
+      - name: Build and test
+        run: bazel test //... --test_output=errors
+      - name: Build the example project
+        working-directory: examples/bazel
+        run: bazel run //:app
 
   # Sanitizers run on Linux only. ASan and UBSan are combined; TSan needs its
   # own build. See the sanitizer configs in .bazelrc.
