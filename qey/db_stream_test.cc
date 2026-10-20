@@ -9,6 +9,7 @@
 
 #include "gtest/gtest.h"
 #include "qey/db.h"
+#include "qey/write_batch.h"
 
 namespace qey {
 namespace {
@@ -332,6 +333,68 @@ TEST_F(StreamTest, ConcurrentAddsGetUniqueAscendingIdsAndReadersSeeOrder) {
   ASSERT_EQ(all->size(), kThreads * kPerThread);
   for (size_t i = 1; i < all->size(); ++i) {
     EXPECT_LT((*all)[i - 1].id, (*all)[i].id);
+  }
+}
+
+TEST_F(StreamTest, ABatchChangesAStreamAndItsNeighboursTogether) {
+  WriteBatch batch;
+  batch.XAdd("s", "hello").XAdd("s", "world").Incr("count", 2).Set("meta", "m");
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(Payloads("s"), (Strings{"hello", "world"}));
+  EXPECT_EQ(*db_.XLastId("s"), std::optional<StreamId>(StreamId{5000, 1}));
+  EXPECT_EQ(db_.Get("count"), "2");
+  EXPECT_EQ(db_.Get("meta"), "m");
+  // The batch can be written again; the stream keeps growing.
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(*db_.XLen("s"), 4);
+  EXPECT_EQ(*db_.XLastId("s"), std::optional<StreamId>(StreamId{5000, 3}));
+}
+
+TEST_F(StreamTest, BatchTrimsSeeTheEntriesAddedBeforeThem) {
+  Add("s", "old1");
+  Add("s", "old2");
+  WriteBatch batch;
+  batch.XAdd("s", "new").XTrimMaxLen("s", 2);
+  ASSERT_TRUE(db_.Write(batch).ok());
+  EXPECT_EQ(Payloads("s"), (Strings{"old2", "new"}));
+
+  WriteBatch by_id;
+  // Same millisecond, so the next entry is exactly last.Next().
+  by_id.XAdd("s", "newer").XTrimMinId("s", db_.XLastId("s")->value().Next());
+  ASSERT_TRUE(db_.Write(by_id).ok());
+  EXPECT_EQ(Payloads("s"), (Strings{"newer"}));
+}
+
+TEST_F(StreamTest, AFailedBatchLeavesAStreamExactlyAsItWas) {
+  Add("s", "a");
+  const StreamId last = Add("s", "b");
+  ASSERT_TRUE(db_.Set("text", "not a number").ok());
+  WriteBatch batch;
+  batch.XAdd("s", "c").XTrimMaxLen("s", 1).XAdd("fresh", "x").Incr("text");
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kNotInteger);
+  EXPECT_EQ(Payloads("s"), (Strings{"a", "b"}));
+  EXPECT_EQ(*db_.XLastId("s"), std::optional<StreamId>(last));
+  EXPECT_EQ(db_.Type("fresh"), KeyType::kNone);  // no stream was left behind
+}
+
+TEST_F(StreamTest, AWrongTypeInABatchFailsTheWholeBatch) {
+  ASSERT_TRUE(db_.Set("str", "v").ok());
+  WriteBatch batch;
+  batch.XAdd("s", "a").XAdd("str", "b");
+  EXPECT_EQ(db_.Write(batch).code(), StatusCode::kWrongType);
+  EXPECT_EQ(db_.Type("s"), KeyType::kNone);
+}
+
+TEST_F(StreamTest, ABatchWithABadStreamArgumentIsRefusedBeforeAnythingChanges) {
+  const uint64_t too_big = static_cast<uint64_t>(INT64_MAX) + 1;
+  for (const WriteBatch& bad : {
+           WriteBatch().XAdd("ok", "1").XTrimMinId("ok", StreamId{too_big, 0}),
+           WriteBatch().XAdd("ok", "1").XTrimMinId("ok", StreamId{0, too_big}),
+           WriteBatch().XAdd("ok", "1").XAdd(
+               "ok", std::string(Db::kMaxValueSize + 1, 'x')),
+       }) {
+    EXPECT_EQ(db_.Write(bad).code(), StatusCode::kInvalidArgument);
+    EXPECT_EQ(db_.Type("ok"), KeyType::kNone);
   }
 }
 

@@ -168,6 +168,28 @@ class WriteBatch {
     return Add(std::move(op));
   }
 
+  // Streams. The same as Db::XAdd(), Db::XTrimMaxLen() and Db::XTrimMinId().
+  // The ID an added entry gets is not reported by Write(); read it with
+  // Db::XLastId() afterwards, or use Db::XAdd() when you need it right away.
+  // Entries added by one batch all get IDs from the clock reading taken when
+  // the batch is applied, so they differ only in their sequence numbers.
+  WriteBatch& XAdd(std::string_view key, std::string_view payload) {
+    return Add(MakeOp(Op::Type::kXAdd, key, payload));
+  }
+  WriteBatch& XTrimMaxLen(std::string_view key, size_t max_len) {
+    Op op = MakeOp(Op::Type::kXTrimMaxLen, key);
+    op.n1 = static_cast<int64_t>(std::min<size_t>(max_len, INT64_MAX));
+    return Add(std::move(op));
+  }
+  WriteBatch& XTrimMinId(std::string_view key, StreamId min_id) {
+    Op op = MakeOp(Op::Type::kXTrimMinId, key);
+    // An ID part above INT64_MAX goes in as a negative number, which Write()
+    // refuses.
+    op.n1 = static_cast<int64_t>(min_id.ms);
+    op.n2 = static_cast<int64_t>(min_id.seq);
+    return Add(std::move(op));
+  }
+
   // Removes all changes from the batch.
   void Clear() { ops_.clear(); }
 

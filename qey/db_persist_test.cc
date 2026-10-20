@@ -1646,7 +1646,16 @@ TEST_F(PersistTest, ReopenedStoreMatchesLiveStore) {
           const int n = 1 + pick(4);
           for (int j = 0; j < n; ++j) {
             const std::string bk = key();
-            switch (pick(19)) {
+            switch (pick(22)) {
+              case 19:
+                batch.XAdd(bk, "p" + std::to_string(pick(100)));
+                break;
+              case 20:
+                batch.XTrimMaxLen(bk, pick(4));
+                break;
+              case 21:
+                batch.XTrimMinId(bk, StreamId{1700000000000u + pick(40), 0});
+                break;
               case 16:
                 batch.ZAdd(bk, {{"m" + std::to_string(pick(6)),
                                  static_cast<double>(pick(7) - 3)}});
@@ -2055,6 +2064,26 @@ TEST_F(PersistTest, ReplayIgnoresAnAddThatIsNotNewerThanTheStream) {
   ASSERT_NE(db, nullptr);
   EXPECT_EQ(Dump(*db, "s"), StreamText({5, 2}, {{{5, 1}, "a"}, {{5, 2}, "b"}}));
   EXPECT_EQ(db->Type("z"), KeyType::kNone);  // nothing came of 0-0
+}
+
+TEST_F(PersistTest, ABatchWithStreamsIsOneRecordAndSurvivesReopen) {
+  std::string live;
+  {
+    auto db = Open();
+    ASSERT_TRUE(db->XAdd("s", "a").ok());
+    const uint64_t before = file_.Size();
+    WriteBatch batch;
+    batch.XAdd("s", "b").XAdd("s", "c").XTrimMaxLen("s", 2).Set("meta", "m");
+    ASSERT_TRUE(db->Write(batch).ok());
+    live = Dump(*db, "s");
+    ASSERT_GT(file_.Size(), before);
+  }
+  Restart(seconds(0));
+  auto db = Open();
+  EXPECT_EQ(Dump(*db, "s"), live);
+  EXPECT_EQ(db->Get("meta"), "m");
+  EXPECT_EQ(*db->XLen("s"), 2);
+  EXPECT_EQ(db->recovery_info().records_replayed, 2);  // the add, the batch
 }
 
 TEST(DbFileTest, SecondOpenOfSamePathIsRefused) {
