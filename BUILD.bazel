@@ -1,1 +1,8 @@
 # Root package. Library targets live under //qey.
+
+# The library, for projects that depend on qey: `@qey//:qey`.
+alias(
+    name = "qey",
+    actual = "//qey:db",
+    visibility = ["//visibility:public"],
+)
