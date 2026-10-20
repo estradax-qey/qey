@@ -15,6 +15,9 @@ It is inspired by Redis/Valkey. Licensed under MIT.
   UBSan) and `bazel test --config=tsan //...` (ThreadSanitizer). Run `tsan`
   after changing anything that involves threads or locking.
 - Language standard: C++20 (set in `.bazelrc`).
+- Locally, run only the tests for the code you changed (for example
+  `bazel test //qey:log_test`) and leave the full suite and the sanitizer
+  configs to CI. Push, then check the run with `gh run list`.
 - CI (`.github/workflows/ci.yml`) checks formatting, runs `bazel test //...`
   on Linux and macOS, and runs the `asan` and `tsan` configs on Linux, for
   every push to `main` and every pull request.
