@@ -1,11 +1,11 @@
 # Streams design
 
-Status: proposed
+Status: accepted (opaque entries, empty streams stay, time-based IDs)
 
 ## Goals
 
 A stream is an append-only sequence of entries under one key. Each entry gets
-an ID that qey assigns, and IDs only grow. It is the general form of a log:
+an ID that qey assigns, built from the time it was added, and IDs only grow. It is the general form of a log:
 chat or agent session history, event feeds, job journals, audit trails.
 
 The motivating use is storing and caching LLM or agent session history, one
@@ -16,13 +16,15 @@ and plain text all work.
 - **Append** one entry atomically and durably, like every other write.
 - **Resume**: read everything after an ID the reader already has. The ID stays
   valid after older entries are trimmed, which a list index does not.
+- **Read by time**: because an ID starts with a millisecond timestamp, "the
+  messages since T" needs no separate index.
 - **Read the tail**: the last N entries, for a context window.
 - **Bound the size**: drop old entries by count or by ID.
 - Works with what already exists: TTL, `Del`, `Rename`, `Keys`/`Scan`,
   `WriteBatch`, compaction, and the CLI.
 
 Non-goals (for now): consumer groups, blocking reads, per-entry TTL, field/value
-entries, time-based IDs, any parsing or indexing of entry contents.
+entries, any parsing or indexing of entry contents.
 
 ## Why not a list
 
@@ -35,23 +37,32 @@ adding to the payload themselves. A stream makes both part of the type.
 ## Model
 
 ```
-stream := last_id:u64  entries (id:u64, payload:string)*   ; ids strictly ascending
+id     := ms:u64 seq:u64            ; ordered by ms, then seq
+stream := last_id:id  entries (id, payload:string)*   ; ids strictly ascending
 ```
 
-- **ID**: one `u64` per stream. The first entry is 1, and each `XAdd` assigns
-  `last_id + 1`. IDs are never reused within a stream's life, including after
-  trimming. The largest valid ID is `INT64_MAX`, since records store IDs as
-  `i64`; a stream at that limit fails further adds with `kOutOfRange`.
+- **ID**: a pair, written `ms-seq`, like Redis. `ms` is Unix time in
+  milliseconds and `seq` breaks ties within one millisecond. Each `XAdd`
+  assigns `max(now, last_id.ms)` as `ms`; if that equals `last_id.ms` the `seq`
+  is `last_id.seq + 1`, otherwise 0. So IDs are strictly increasing **even if
+  the wall clock steps backwards**: the stream keeps using its last `ms` and
+  counts `seq` up until the clock catches up. An ID is never reused within a
+  stream's life, including after trimming. Both parts are at most `INT64_MAX`
+  because records store them as `i64`; an add that would exceed that fails with
+  `kOutOfRange`.
+- **Time source**: `OpenOptions::wall_now` (and the in-memory `Db`'s wall
+  clock), the same override tests already use. The first entry of a stream has
+  `seq` 0, and an empty stream's `last_id` starts as 0-0.
 - **Entry**: one opaque string, at most `Db::kMaxValueSize`.
-- **Time**: not part of the ID. A caller that wants a timestamp puts it in the
-  payload. A single counter is simpler than Redis's `ms-seq` pair, cannot go
-  backwards when the clock does, and is cheap to compare and store.
+- **Not a trusted timestamp.** The `ms` is when this process added the entry,
+  adjusted to stay ordered. It is good for ordering and "since T" queries, not
+  for audit.
 - **Empty streams stay.** Trimming every entry leaves a stream with no entries
-  but its `last_id`, because removing it would let IDs restart at 1 and make a
-  reader's saved cursor point at the wrong entry. This differs from the other
-  collections, which disappear when empty. `Del` removes the stream for real,
-  and then IDs do restart; a reader that holds a cursor across a `Del` of the
-  same key has to expect that. `XLen` is 0 and `XRange` returns nothing for an
+  but its `last_id`, so a saved cursor stays meaningful and the clock-step
+  guarantee above still holds. This differs from the other collections, which
+  disappear when empty. `Del` removes the stream for real; IDs then start again
+  from the clock, so a cursor saved before the `Del` still sorts before the new
+  entries unless the clock moved backwards in between. `XLen` is 0 and `XRange` returns nothing for an
   empty stream; `Type` still says stream.
 - **Key type**: a new `KeyType::kStream`. Commands for another type fail with
   `kWrongType`, and `Set` replaces a stream, as for the other types.
@@ -62,14 +73,26 @@ trimming from the front are cheap and a lookup by ID is a binary search.
 ## API
 
 ```cpp
+struct StreamId {
+  uint64_t ms = 0;   // Unix milliseconds.
+  uint64_t seq = 0;  // Orders entries within one millisecond.
+  // Ordered by ms, then seq.
+  friend auto operator<=>(const StreamId&, const StreamId&) = default;
+  // The smallest ID greater than this one: the cursor to resume from.
+  StreamId Next() const;
+  // "ms-seq". Parse() also accepts "ms", meaning ms-0.
+  std::string ToString() const;
+  static std::optional<StreamId> Parse(std::string_view text);
+};
+
 struct StreamEntry {
-  uint64_t id;
+  StreamId id;
   std::string payload;
 };
 
 // Appends `payload` and returns its ID. With `max_len`, then trims the stream
 // to its newest `max_len` entries, atomically with the append.
-StatusOr<uint64_t> XAdd(std::string_view key, std::string_view payload,
+StatusOr<StreamId> XAdd(std::string_view key, std::string_view payload,
                         std::optional<size_t> max_len = std::nullopt);
 
 // The number of entries; 0 for a missing key.
@@ -77,23 +100,26 @@ StatusOr<size_t> XLen(std::string_view key);
 
 // The ID of the newest entry ever added, or nullopt for a missing key. Valid
 // for an empty stream, which still remembers it.
-StatusOr<std::optional<uint64_t>> XLastId(std::string_view key);
+StatusOr<std::optional<StreamId>> XLastId(std::string_view key);
 
-// Up to `count` entries with an ID greater than `after`, oldest first. With
-// `after` of 0, from the start.
-StatusOr<std::vector<StreamEntry>> XRange(std::string_view key, uint64_t after,
-                                          size_t count);
+// Up to `count` entries with an ID of at least `from` and, if given, at most
+// `to`, oldest first. `StreamId{}` starts at the beginning. To resume after an
+// entry you have seen, pass its `id.Next()`. To read a time window, pass
+// `StreamId{ms, 0}`.
+StatusOr<std::vector<StreamEntry>> XRange(
+    std::string_view key, StreamId from, size_t count,
+    std::optional<StreamId> to = std::nullopt);
 
 // Up to `count` newest entries, newest first, optionally only those with an ID
-// below `before`.
+// at most `before`.
 StatusOr<std::vector<StreamEntry>> XRevRange(
     std::string_view key, size_t count,
-    std::optional<uint64_t> before = std::nullopt);
+    std::optional<StreamId> before = std::nullopt);
 
 // Removes all but the newest `max_len` entries, or all entries with an ID below
 // `min_id`. Return how many were removed. A missing key is not an error.
 StatusOr<size_t> XTrimMaxLen(std::string_view key, size_t max_len);
-StatusOr<size_t> XTrimMinId(std::string_view key, uint64_t min_id);
+StatusOr<size_t> XTrimMinId(std::string_view key, StreamId min_id);
 ```
 
 `XAdd`, `XTrimMaxLen` and `XTrimMinId` can be added to a `WriteBatch`, so that
@@ -106,7 +132,7 @@ Errors follow the rest of the API: `kWrongType` for another type,
 limit. A read of a missing key returns an empty result, not an error.
 
 `XRange`'s `count` is required and a read holds the store's lock while it
-copies, as `Keys` does. The cursor form (`after`) is what makes paging
+copies, as `Keys` does. Resuming from `id.Next()` is what makes paging
 possible; there is no unbounded read.
 
 ## Log records
@@ -116,25 +142,28 @@ validates key, `fresh`, strings and `i64` fields:
 
 | type | name  | payload                                              |
 |------|-------|------------------------------------------------------|
-| 21   | XADD  | key, fresh, payload string, id:i64                   |
-| 22   | XTRIM | key, min_id:i64                                      |
+| 21   | XADD  | key, fresh, payload string, id.ms:i64, id.seq:i64    |
+| 22   | XTRIM | key, min_id.ms:i64, min_id.seq:i64                   |
+
+The two `i64` fields are the ones the collection layout already allows.
 
 As with the other collections, **only effective changes are logged**, resolved
 against the state at the time, so replay does no interpretation:
 
-- `XAdd` logs the ID it assigned. Replay checks that it is greater than the
+- `XAdd` logs the ID it assigned, so replay never reads the clock. Replay checks that it is greater than the
   stream's `last_id` and sets `last_id` to it. An ID that is not greater is a
   corrupt log and fails `Open` with `kCorruption`.
 - A trim, whether by length or by ID, logs one `XTRIM` with an absolute
   `min_id`, never a count. It removes entries with an ID below `min_id` and
-  raises `last_id` to at least `min_id - 1`. The second part is what lets one
+  raises `last_id` to at least the ID just before `min_id` (0-0 if there is
+  none). The second part is what lets one
   record express "the stream is now empty but remembers where it was".
   `XAdd` with `max_len` is a `BATCH` of an `XADD` and an `XTRIM`.
 - A trim that removes nothing logs nothing. `XTrimMaxLen` on a stream that is
   within the limit is a no-op.
 - `fresh` means the same as for other collections: when an add creates a stream
   under a name whose earlier stream expired in memory without being logged,
-  replay starts from an empty stream with `last_id` 0 and no TTL.
+  replay starts from an empty stream with `last_id` 0-0 and no TTL.
 
 Unknown record types still make an older reader fail with `kCorruption`, so a
 file with streams is never silently misread by a version that lacks them. That
@@ -146,7 +175,7 @@ A stream is written as `XADD` records in pieces of about
 `compact_chunk_bytes`, the first with `fresh = 1`, so no record outgrows the
 record limit. Each carries the ID the entry already has, so IDs survive
 compaction. If `last_id` is greater than the newest entry's ID (the tail was
-trimmed or the stream is empty), an `XTRIM` with `min_id = last_id + 1`
+trimmed or the stream is empty), an `XTRIM` with `min_id = last_id.Next()`
 follows, which restores `last_id`. An `EXPIRE` follows if the key has a TTL,
 as for other collections.
 
@@ -164,7 +193,7 @@ New commands in `cli/commands.cc`, each with a test in `cli/cli_test.cc`:
 ```
 qey --db app.qey xadd session:42 '{"role":"user","content":"hi"}' [--maxlen N]
 qey --db app.qey xlen session:42
-qey --db app.qey xrange session:42 [--after ID] --count N
+qey --db app.qey xrange session:42 --count N [--from ID] [--after ID] [--to ID]
 qey --db app.qey xrevrange session:42 --count N [--before ID]
 qey --db app.qey xtrim session:42 --maxlen N        # or --minid ID
 qey --db app.qey xlastid session:42
@@ -172,28 +201,34 @@ qey --db app.qey xlastid session:42
 
 `--count` has no default on `xrange`, to avoid accidentally printing an
 unbounded stream; `xrevrange` is meant for "the last N". In `--json` output an
-entry is `{"id":7,"value":"..."}`, with the same `{"base64":...}` form for a
+entry is `{"id":"1760000000000-0","value":"..."}`, with the same `{"base64":...}` form for a
 payload that is not valid UTF-8, so a JSONL line round-trips as a string. An
-agent can parse the `value` itself. The IDs are JSON numbers; the limit of
-`INT64_MAX` is above 2^53, so a JavaScript consumer that cares should read
-them as strings. `--json` therefore also accepts `--ids-as-strings`.
+agent can parse the `value` itself. IDs are always JSON strings in `ms-seq`
+form, which also keeps them exact in languages whose numbers are doubles.
+`--from` and `--to` are inclusive and take `ms-seq` or just `ms`; `--after ID`
+means `--from` the ID's `Next()`, for resuming. `xadd` prints the new ID.
 
 ## Memory and cost
 
-Per entry: the payload, the ID, and the `std::deque` slot, about 40 bytes of
+Per entry: the payload, the ID, and the `std::deque` slot, about 48 bytes of
 overhead beyond the payload on a 64-bit platform (a `std::string` is 32 bytes
-and the ID 8, with small payloads stored inline). `XAdd` and front trims are
+and the ID 16, with small payloads stored inline). `XAdd` and front trims are
 O(1) amortized and O(k) for k removed. `XRange` is O(log n + count).
 `bench/` gets a stream suite measuring add throughput, tail-read latency,
 memory per entry and file size, like the existing suites.
 
 ## Testing
 
-- Unit tests: IDs ascend and are never reused after a trim; trimming to empty
-  keeps `last_id`; `max_len` is atomic with the add; `XRange` pages cover
+- Unit tests, with a fake wall clock: IDs ascend and are never reused after a
+  trim; several adds in one millisecond get ascending `seq`; **a clock that
+  steps backwards** still yields ascending IDs; `XRange` over a time window;
+  `StreamId::Parse` and `ToString` round-trip; trimming to empty keeps
+  `last_id`; `max_len` is atomic with the add; `XRange` pages cover
   every entry exactly once; wrong-type errors; limits.
 - Replay equivalence: random operation sequences, reopen, compare the full
-  state including `last_id`.
+  state including `last_id`. Replay uses the logged IDs, so a reopen under a
+  different clock gives the same stream, and a new add after the reopen is
+  still greater than every logged ID.
 - Torn tail at every byte offset for a log with streams.
 - Compaction: a stream larger than a chunk (using `compact_chunk_bytes`), an
   empty stream with a high `last_id`, a stream with a TTL.
@@ -223,12 +258,9 @@ builds a large collection, belongs in CI and should be kept small with
 
 - **Field/value entries.** Redis streams hold field/value pairs. Opaque entries
   are simpler and cover JSONL. Pairs could be added later as a second entry
-  encoding without changing IDs or the log layout. This note assumes opaque.
-- **Empty streams that stay.** Keeping `last_id` costs one entry's worth of
+  encoding without changing IDs or the log layout. Decided: opaque.
+- **Empty streams that stay** (decided: yes). Keeping `last_id` costs one entry's worth of
   memory per emptied stream and breaks the "empty collections disappear" rule.
   The alternative is to let a trimmed-empty stream disappear and accept that
   cursors may restart. This note keeps the stream, because a wrong cursor
   silently skips or repeats history.
-- **IDs as a single counter versus `ms-seq`.** A single counter is assumed. If
-  time-range queries matter, a payload timestamp plus a client-side filter
-  covers most cases; a time-based ID can be a later, separate type.
