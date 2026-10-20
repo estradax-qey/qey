@@ -50,12 +50,6 @@ jobs:
           - target: macos-arm64
             os: macos-latest
             flags: --macos_minimum_os=13.3
-          # Cross-compiled on the arm64 runner. Run under Rosetta if it is
-          # there, to smoke-test it.
-          - target: macos-x86_64
-            os: macos-latest
-            flags: --macos_cpus=x86_64 --macos_minimum_os=13.3
-            exec: arch -x86_64
     steps:
       - uses: actions/checkout@v7
       - uses: bazel-contrib/setup-bazel@0.19.1
@@ -66,21 +60,15 @@ jobs:
       - name: Build
         run: bazel build -c opt --strip=always ${{ matrix.flags }} //cli:qey
       - name: Smoke test
-        env:
-          EXEC: ${{ matrix.exec }}
         run: |
           bin=bazel-bin/cli/qey
           file "$bin"
-          if [ -n "$EXEC" ] && ! $EXEC /usr/bin/true 2>/dev/null; then
-            echo "cannot run a ${{ matrix.target }} binary on this runner; skipping"
-            exit 0
-          fi
           db="$RUNNER_TEMP/smoke.qey"
-          $EXEC "$bin" --version
-          $EXEC "$bin" --db "$db" set greeting hello
-          test "$($EXEC "$bin" --db "$db" get greeting)" = hello
-          $EXEC "$bin" --db "$db" xadd s '{"role":"user"}'
-          test "$($EXEC "$bin" --db "$db" xlen s)" = 1
+          "$bin" --version
+          "$bin" --db "$db" set greeting hello
+          test "$("$bin" --db "$db" get greeting)" = hello
+          "$bin" --db "$db" xadd s '{"role":"user"}'
+          test "$("$bin" --db "$db" xlen s)" = 1
       - name: Package
         run: |
           version="${GITHUB_REF_NAME}"

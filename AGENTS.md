@@ -77,9 +77,9 @@ version may change the API. To release:
    `cli/cli.cc`, and add a `## [X.Y.Z] - date` section to `CHANGELOG.md`.
    `.github/scripts/check-version.sh` checks all three, and CI runs it.
 2. Merge, then tag the commit and push the tag: `git tag vX.Y.Z && git push
-   origin vX.Y.Z`. The `release` workflow builds the CLI for Linux and macOS,
-   and publishes the archives, checksums and the changelog section as a GitHub
-   release.
+   origin vX.Y.Z`. The `release` workflow builds the CLI for Linux (x86_64,
+   arm64) and macOS (arm64 only), and publishes the archives, checksums and the
+   changelog section as a GitHub release.
 3. To test the workflow without publishing, run it by hand (`gh workflow run
    release.yml`); that builds everything and publishes nothing.
 
