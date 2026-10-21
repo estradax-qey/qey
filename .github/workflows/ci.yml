@@ -34,18 +34,14 @@ jobs:
         run: .github/scripts/check-version.sh
 
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: bazel-contrib/setup-bazel@0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-${{ matrix.os }}
+          disk-cache: ${{ github.workflow }}-test
           repository-cache: true
       - name: Build and test
         run: bazel test //... --test_output=errors

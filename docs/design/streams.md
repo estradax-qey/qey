@@ -243,7 +243,7 @@ memory per entry and file size, like the existing suites.
 
 **Where tests run.** Locally, run only the targets for the code being changed,
 for example `bazel test //qey:log_test`, so each step stays quick. The full
-suite, the Linux and macOS jobs, and the `asan` and `tsan` configs run in
+suite, the Linux job, and the `asan` and `tsan` configs run in
 GitHub Actions on every push and pull request. A slow test, such as one that
 builds a large collection, belongs in CI and should be kept small with
 `compact_chunk_bytes` rather than by building huge data.

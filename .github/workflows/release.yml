@@ -46,10 +46,6 @@ jobs:
           - target: linux-arm64
             os: ubuntu-22.04-arm
             flags: --linkopt=-static-libstdc++ --linkopt=-static-libgcc
-          # std::to_chars for doubles needs macOS 13.3.
-          - target: macos-arm64
-            os: macos-latest
-            flags: --macos_minimum_os=13.3
     steps:
       - uses: actions/checkout@v7
       - uses: bazel-contrib/setup-bazel@0.19.1

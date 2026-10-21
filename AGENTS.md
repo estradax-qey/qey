@@ -19,7 +19,7 @@ It is inspired by Redis/Valkey. Licensed under MIT.
   `bazel test //qey:log_test`) and leave the full suite and the sanitizer
   configs to CI. Push, then check the run with `gh run list`.
 - CI (`.github/workflows/ci.yml`) checks formatting, runs `bazel test //...`
-  on Linux and macOS, and runs the `asan` and `tsan` configs on Linux, for
+  on Linux, and runs the `asan` and `tsan` configs on Linux, for
   every push to `main` and every pull request.
 
 ## Code style
@@ -78,7 +78,7 @@ version may change the API. To release:
    `.github/scripts/check-version.sh` checks all three, and CI runs it.
 2. Merge, then tag the commit and push the tag: `git tag vX.Y.Z && git push
    origin vX.Y.Z`. The `release` workflow builds the CLI for Linux (x86_64,
-   arm64) and macOS (arm64 only), and publishes the archives, checksums and the
+   arm64), and publishes the archives, checksums and the
    changelog section as a GitHub release.
 3. To test the workflow without publishing, run it by hand (`gh workflow run
    release.yml`); that builds everything and publishes nothing.
